@@ -16,9 +16,14 @@
 3. 条件路由 (Conditional Edges): 根据政策合规性与金额风控分流至自动执行或人工介入。
 4. 持久化支持 (PostgreSQL Checkpointer): 支持挂载基于 PG 的状态持久化与断点续跑。
 5. LLM 意图识别与槽位填充 (Slot Filling): 引入真实大模型 (项目内置 LLMRouter) 从用户
-   自然语言中抽取意图/订单号/原因等槽位; LLM 输出经 Pydantic Schema (SlotExtractionResult)
-   强校验枚举/格式/长度，非法输出拒绝并降级; 必要槽位缺失时路由到追问节点向用户反问补槽,
+   自然语言中抽取意图/订单号/原因等槽位; 采用 function calling (SLOT_TOOL + tool_choice)
+   从协议层保证结构化输出, LLM 输出再经 Pydantic Schema (SlotExtractionResult) 强校验
+   枚举/格式/长度，非法输出拒绝并降级; 必要槽位缺失时路由到追问节点向用户反问补槽,
    用户补充后同一线程重新抽取, 替代原先写死订单号兜底的做法; LLM 不可用时降级为关键词规则。
+   槽位格式合法 ≠ 业务可用: 订单号在意图节点即查库校验存在性+归属权 (防越权), 校验失败
+   剔除槽位并携带针对性话术回流追问; 查询/政策节点失败不再裸 raise 崩图, 分别降级为
+   RETRY_ASK 回流追问与 ESCALATE_HUMAN 透传转人工; 意图枚举含 OTHER, 非售后诉求经
+   越界意图网关短路为 OUT_OF_SCOPE 出口直接答复, 不触发任何售后工具写操作。
 """
 
 import sys                                              # 导入系统模块，用于操作 Python 解释器的模块搜索路径
@@ -43,6 +48,7 @@ from react_ai.llm.base import ChatMessage               # 导入对话消息模�
 from react_ai.llm.router import LLMRouter               # 导入 LLM 路由器：主模型失败自动降级到备用模型
 from react_ai.llm.providers.deepseek import DeepSeekProvider  # 导入 DeepSeek 客户端（OpenAI 兼容协议，默认主模型）
 from react_ai.llm.providers.openai import OpenAIProvider  # 导入 OpenAI 客户端（备用降级目标）
+from react_ai.schemas.tools import ToolDefinition, ToolParameterSchema  # 导入工具定义与参数 Schema 模型，用于 function calling 结构化抽槽
 
 # 导入本项目已定义好的电商售后工具与上下文
 from react_ai.tools.base import ToolContext             # 导入工具执行上下文（携带调用方、租户、用户、幂等键等信息）
@@ -69,7 +75,7 @@ escalate_to_human_tool = EscalateToHumanTool()         # 创建转人工工具�
 # ============================================================================
 SLOT_EXTRACTION_PROMPT = """你是电商售后系统的意图与槽位抽取器。只输出一个 JSON 对象，禁止输出任何其他文字。
 字段定义:
-- intent: 意图枚举，取值 RETURN_AND_REFUND(退货退款) / REFUND_ONLY(仅退款) / EXCHANGE(换货)
+- intent: 意图枚举，取值 RETURN_AND_REFUND(退货退款) / REFUND_ONLY(仅退款) / EXCHANGE(换货) / OTHER(非售后诉求：查天气、问客服电话、闲聊等越界内容一律归此类)
 - order_id: 用户明确提供的订单号原文；用户未提及时必须为 null，严禁编造
 - reason: 售后原因简述（不超过20字）；未提及为 null
 - reason_type: 原因大类，取值 quality_issue(商品破损/质量瑕疵等质量问题) / no_reason(不喜欢等无理由诉求)
@@ -81,7 +87,7 @@ REQUIRED_SLOTS = ("intent", "order_id", "reason_type")  # 必要槽位：意图�
 
 class SlotExtractionResult(BaseModel):                 # Pydantic 槽位抽取结果 Schema：大模型输出必须通过校验才可信
     """约束 LLM 结构化输出的枚举取值/字段格式/长度上限，非法输出直接拒绝并触发关键词降级。"""
-    intent: Optional[Literal["RETURN_AND_REFUND", "REFUND_ONLY", "EXCHANGE"]] = None  # 意图枚举：超出取值范围即校验失败
+    intent: Optional[Literal["RETURN_AND_REFUND", "REFUND_ONLY", "EXCHANGE", "OTHER"]] = None  # 意图枚举（含 OTHER 越界出口，§2.3）：超出取值范围即校验失败
     order_id: Optional[str] = Field(default=None, pattern=r"^[A-Za-z0-9_\-]{4,64}$")  # 订单号格式：仅允许字母/数字/下划线/连字符，防幻觉文本与注入
     reason: Optional[str] = Field(default=None, max_length=50)  # 原因描述长度上限，防止模型冗长输出污染状态
     reason_type: Optional[Literal["quality_issue", "no_reason"]] = None  # 原因大类枚举
@@ -99,6 +105,44 @@ class SlotExtractionResult(BaseModel):                 # Pydantic 槽位抽取�
 _llm_router: Optional[LLMRouter] = None                # LLM 路由器全局懒加载单例（首次使用时初始化）
 
 _SLOT_VALUE_FIELD = {"intent": "value", "order_id": "string_value", "reason": "string_value", "reason_type": "value"}  # 各槽位对应的取值字段名映射
+
+# function calling 抽槽工具定义：参数 JSON Schema 即 SlotExtractionResult 的协议层镜像，
+# 配合 tool_choice 强制调用，模型返回由 API 保证是结构化 tool_calls 而非自由文本 JSON
+SLOT_TOOL = ToolDefinition(
+    name="output_aftersales_slots",                    # 工具名，作为 tool_choice 强制调用的目标
+    description="从用户售后诉求对话中提取意图与槽位并结构化输出",  # 供模型理解何时调用（本场景恒定调用）
+    parameters=ToolParameterSchema(                    # JSON Schema 约束返回参数结构
+        type="object",
+        properties={
+            "intent": {                                 # 意图枚举：协议层限定取值范围
+                "type": "string",
+                "enum": ["RETURN_AND_REFUND", "REFUND_ONLY", "EXCHANGE", "OTHER"],
+                "description": "退货退款/仅退款/换货；非售后诉求（查天气、问客服电话、闲聊等）选 OTHER；无法判断时省略该字段",
+            },
+            "order_id": {                               # 订单号：未提及必须省略，严禁编造
+                "type": "string",
+                "description": "用户明确提供的订单号原文；未提及时不要填写",
+            },
+            "reason": {                                 # 原因简述
+                "type": "string",
+                "description": "售后原因简述（不超过20字）",
+            },
+            "reason_type": {                            # 原因大类枚举
+                "type": "string",
+                "enum": ["quality_issue", "no_reason"],
+                "description": "质量问题 quality_issue / 无理由 no_reason",
+            },
+            "missing_slots": {                          # 模型自报缺失槽位
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "无法从对话判断的必要槽位名列表",
+            },
+        },
+        required=[],                                    # 全部可选：缺槽由节点侧统一计算并触发追问
+    ),
+)
+
+_SLOT_KEYS = {"intent", "order_id", "reason", "reason_type", "missing_slots"}  # 合法槽位键集合，用于甄别模拟/异常返回的 tool_calls 参数
 
 
 def get_llm_router() -> LLMRouter:                     # 懒加载构建 LLM 路由器
@@ -149,6 +193,8 @@ class AfterSalesState(TypedDict, total=False):         # 定义全流程共享�
     missing_slots: Optional[list]           # 当前仍缺失的必要槽位名列表
     slot_rounds: int                  # 已追问轮数，超过上限后放弃补槽转人工
     dialog_history: Optional[list]    # 多轮补槽对话历史 [{role, content}]，供 LLM 结合上下文抽取
+    order_validated_id: Optional[str] # 已通过存在性+归属权业务校验的订单号（换单号后需重新校验）
+    slot_error: Optional[str]         # 槽位业务校验失败文案，非空时优先作为追问话术回流给用户
 
     # 外部与工具执行结果缓存
     order_info: Optional[Dict[str, Any]]      # 订单详情
@@ -157,7 +203,7 @@ class AfterSalesState(TypedDict, total=False):         # 定义全流程共享�
 
     # 决策与判定
     is_eligible: bool                         # 规则判定是否通过
-    decision: Optional[str]                   # 最终决策: AUTO_REFUND / RETURN_SHIPPING / ESCALATE_HUMAN / REJECTED
+    decision: Optional[str]                   # 最终决策: AUTO_REFUND / RETURN_SHIPPING / ESCALATE_HUMAN / REJECTED / RETRY_ASK / OUT_OF_SCOPE
     human_reason: Optional[str]               # 转人工的具体原因
 
     # 写操作结果与最终回复
@@ -170,16 +216,30 @@ class AfterSalesState(TypedDict, total=False):         # 定义全流程共享�
 # 2. 状态图节点 (Graph Nodes - 调用项目内置真实工具)
 # ============================================================================
 async def extract_slots_via_llm(messages: list) -> Optional[Dict[str, Any]]:  # 调用真实 LLM 完成意图与槽位抽取，失败返回 None 由上层降级
-    """携带对话上下文调用 LLM，要求仅输出 JSON 并解析为槽位字典。"""
+    """function calling 结构化抽槽：tool_choice 强制模型调用 SLOT_TOOL，
+    槽位取自协议层保证的 tool_calls.arguments；模型未走工具路径时回退解析正文 JSON。"""
     try:                                                 # 包住整个 LLM 调用，网络/解析异常统一走降级
         router = get_llm_router()                        # 获取（或懒初始化）LLM 路由器
         request_messages = [ChatMessage(role="system", content=SLOT_EXTRACTION_PROMPT)] + [  # 系统提示词 + 多轮对话历史
             ChatMessage(role=m["role"], content=m["content"]) for m in messages               # 将历史 dict 转为 ChatMessage 模型
         ]
-        response = await router.generate(request_messages, temperature=0.0, max_tokens=300)  # 低温度调用，保证输出稳定可解析
-        raw = _extract_json(response.content or "")    # 从回复文本提取并解析 JSON 槽位字典
-        if raw is None:                                # 文本中不含合法 JSON 对象
-            return None                                # 直接触发关键词降级
+        response = await router.generate(                # 低温度调用并强制工具：协议层保证结构化输出
+            request_messages,
+            tools=[SLOT_TOOL],                           # 传入槽位 JSON Schema 工具定义
+            temperature=0.0,                             # 零温度保证抽取确定性
+            max_tokens=300,
+            tool_choice=SLOT_TOOL.name,                  # 强制调用抽槽工具，模型不再输出自由文本
+        )
+        raw = None                                       # 槽位原始字典，优先取 tool_calls
+        if response.tool_calls:                          # 首选路径：function calling 结构化返回
+            tc = response.tool_calls[0]                  # 取首个工具调用（tool_choice 已限定唯一目标）
+            args = tc.arguments if isinstance(tc.arguments, dict) else _extract_json(str(tc.arguments))  # 参数已是 dict 或需二次解析
+            if args and set(args) & _SLOT_KEYS:          # 参数须命中至少一个已知槽位键，甄别模拟器的无关返回
+                raw = args                               # 采用协议层结构化槽位
+        if raw is None and response.content:             # 回退路径：模型忽略 tool_choice 时从正文抢救 JSON
+            raw = _extract_json(response.content)        # 兼容旧行为的兜底解析
+        if raw is None:                                  # 两条路径均无有效结构
+            return None                                  # 直接触发关键词降级
         validated = SlotExtractionResult.model_validate(raw)  # Pydantic Schema 强校验：枚举/格式/长度不合规即抛 ValidationError
         print(f"[LLM] 槽位输出通过 Pydantic 校验: {validated.model_dump(exclude_none=True)}")  # 打印规范化后的槽位
         return validated.model_dump(exclude_none=True) # 返回校验清洗后的槽位字典（None 字段已剔除）
@@ -198,13 +258,29 @@ def fallback_extract_slots(user_msg: str) -> Dict[str, Any]:  # LLM 不可用时
     has_exchange = any(k in user_msg for k in ["换货", "换一个", "换新"])  # 命中"换"类关键词判定为换货意图
     has_no_reason = any(k in user_msg for k in ["不想要", "不喜欢", "无理由", "后悔", "不需要"])  # 命中"无理由"类关键词判定为非质量问题
     order_match = re.search(r"ORD[_\-A-Z0-9]+|\b\d{8,}\b", user_msg, re.IGNORECASE)  # 正则尝试从文本提取订单号（如 ORD_CLOTH_001 / 8 位以上数字）
+    has_any_signal = has_refund or has_exchange or is_quality or has_no_reason or bool(order_match)  # 是否命中任何售后相关信号
     return {                                             # 组装与 LLM 输出同构的槽位字典
-        "intent": ("RETURN_AND_REFUND" if has_refund else "EXCHANGE") if (has_refund or has_exchange) else None,  # 无法判断意图时置 None，交由追问流程
+        "intent": (("RETURN_AND_REFUND" if has_refund else "EXCHANGE") if (has_refund or has_exchange) else ("OTHER" if not has_any_signal else None)),  # 售后词->意图；完全无售后信号->OTHER 越界出口（§2.3）；有质量/订单线索但无动作词->None 交由追问
         "reason_type": "quality_issue" if is_quality else ("no_reason" if has_no_reason else None),  # 仅显式表达才能判定大类，否则置 None 触发追问
         "reason": "关键词规则判定：质量问题" if is_quality else ("关键词规则判定：无理由" if has_no_reason else None),  # 规则模式下的原因描述
         "order_id": order_match.group(0) if order_match else None,  # 正则命中则填订单号，未命中置 None 触发追问（不写死兜底）
         "missing_slots": [],                             # 缺失槽位由主节点统一计算，此处留空
     }
+
+
+def validate_order_slot(order_id: str, user_id: str) -> tuple:  # 槽位业务校验：格式合法 ≠ 业务可用，查库验证存在性+归属权
+    """返回 (错误文案, 订单数据)。错误文案为 None 表示校验通过；
+    失败不抛异常，由调用方剔除槽位并回流追问分支。"""
+    ctx = ToolContext(caller_id="langgraph-aftersales", tenant_id="default", user_id=user_id)  # 以当前用户身份查询
+    try:                                                 # 工具内部超时/连接失败等硬异常同样收敛为文案
+        res = query_order_tool.call({"order_id": order_id}, ctx)  # 复用真实订单查询工具做存在性核验
+    except Exception as exc:                             # 数据库不可用等基础设施异常
+        return f"订单系统暂时不可用（{exc}），请稍后重试或回复『人工』由专员跟进", None
+    if not res.ok or not res.data:                       # 订单不存在或查询失败
+        return "未查询到该订单，请核对订单号（可在『我的订单』页面复制）后重新发送", None
+    if res.data.get("user_id") != user_id:               # 归属权校验：防止用他人订单号发起售后（越权）
+        return "该订单不属于当前账号，请使用下单账号重新提交订单号，或回复『人工』", None
+    return None, res.data                                # 校验通过，顺带返回订单详情供缓存复用
 
 
 def intent_recognition_node(state: AfterSalesState) -> Dict[str, Any]:  # 节点1：调用真实 LLM 从多轮对话中抽取意图与槽位，累积合并并计算缺失必要槽位
@@ -239,7 +315,36 @@ def intent_recognition_node(state: AfterSalesState) -> Dict[str, Any]:  # 节点
                 }
 
     missing = [s for s in REQUIRED_SLOTS if not slot_values.get(s)]  # 计算尚未填充的必要槽位
-    print(f"[Node: intent_recognition] 槽位抽取完成: {json.dumps({k: (v.get('value') or v.get('string_value')) for k, v in slot_values.items()}, ensure_ascii=False)}; 缺失={missing or '无'}")  # 打印当前槽位填充全景
+
+    # ---- 越界意图网关（§2.3）：OTHER 不进售后流程，直接产出 OUT_OF_SCOPE 出口 ----
+    if (slot_values.get("intent") or {}).get("value") == "OTHER":  # 意图判定为非售后诉求（仅在意图槽位首次填入时生效，防止打断进行中流程）
+        print("[Node: intent_recognition] 越界意图 OTHER，走 OUT_OF_SCOPE 出口，不触发任何售后工具")  # 打印网关拦截轨迹
+        return {                                         # 短路返回：跳过业务校验与售后链路
+            "intent": "OTHER",                           # 顶层镜像：越界意图
+            "slot_values": slot_values,                  # 写回槽位表（intent=OTHER 已记录）
+            "missing_slots": [],                         # 清空缺失清单，防止 route_slots 误触发售后补槽追问
+            "dialog_history": history,                   # 写回对话历史
+            "decision": "OUT_OF_SCOPE",                  # 越界决策标记，route_slots 据此直送通知节点
+            "slot_error": None,                          # 无业务校验错误
+            "final_reply": "我目前只支持退货退款、仅退款、换货类售后诉求，其他问题请回复『人工』由专员为您解答；如需售后，请直接描述您的问题。",  # 越界友好话术
+        }
+
+    # ---- 槽位业务校验（§2.2）：新出现或变更过的订单号需查库验证存在性+归属权 ----
+    user_id = state.get("user_id", "USR_001")            # 当前操作用户，用于归属权核验
+    order_val = (slot_values.get("order_id") or {}).get("string_value")  # 本轮待校验的订单号
+    slot_error = None                                    # 业务校验失败文案，驱动针对性追问
+    biz_extra: Dict[str, Any] = {}                       # 校验产生的附加状态增量
+    if order_val and order_val != state.get("order_validated_id"):  # 首次填入或用户换了单号才校验，已校验过则跳过
+        err, order_data = validate_order_slot(order_val, user_id)  # 存在性 + 归属权双重校验
+        if err:                                          # 校验不通过：格式合法但业务不可用
+            slot_error = err                             # 记录失败文案，供 ask_user 生成针对性追问
+            slot_values.pop("order_id", None)            # 从槽位表剔除无效单号
+            order_val = None                             # 清空局部变量，使顶层镜像同步为 None
+            missing = [s for s in REQUIRED_SLOTS if not slot_values.get(s)]  # 重算缺失清单 -> route_slots 自然回流追问
+        else:                                            # 校验通过
+            biz_extra = {"order_validated_id": order_val, "order_info": order_data}  # 记录已校验单号并缓存订单详情，节点2免重复查询
+
+    print(f"[Node: intent_recognition] 槽位抽取完成: {json.dumps({k: (v.get('value') or v.get('string_value')) for k, v in slot_values.items()}, ensure_ascii=False)}; 缺失={missing or '无'}" + (f"; 业务校验失败={slot_error}" if slot_error else ""))  # 打印当前槽位填充全景
 
     return {                                             # 返回本节点产出的状态增量（LangGraph 会将其合并进全局状态）
         "intent": (slot_values.get("intent") or {}).get("value"),        # 顶层镜像：供下游节点直接读取意图
@@ -249,6 +354,9 @@ def intent_recognition_node(state: AfterSalesState) -> Dict[str, Any]:  # 节点
         "slot_values": slot_values,                      # 写回累积后的槽位表
         "missing_slots": missing,                        # 缺失清单驱动条件路由决定是否追问
         "dialog_history": history,                       # 写回更新后的对话历史（追问后用户补充时携带上下文再抽取）
+        "slot_error": slot_error,                        # 业务校验失败文案（通过则 None，同时清除上一轮残留）
+        "decision": None,                                # 新一轮开始，清除上一轮 RETRY_ASK 等残留决策，防止路由误判
+        **biz_extra,                                     # 校验通过时附带 order_validated_id 与缓存的 order_info
     }
 
 
@@ -290,7 +398,11 @@ def ask_user_node(state: AfterSalesState) -> Dict[str, Any]:  # 节点1.5：必�
         "order_id": "请提供您的订单号，方便我为您查询订单信息。",  # 订单号缺失提问（替代原先写死兜底）
         "reason_type": "方便说明一下原因吗？是商品质量问题（如破损、瑕疵），还是不想要了？",  # 原因大类缺失提问
     }
-    question = "为了帮您处理售后申请，" + " ".join(ask_map[s] for s in missing if s in ask_map)  # 拼接所有缺失槽位的追问
+    slot_error = state.get("slot_error")                 # 业务校验失败文案（订单不存在/非本人订单等）
+    if slot_error:                                       # 校验失败场景：针对性话术优先于通用补槽提问
+        question = slot_error
+    else:                                                # 普通缺槽场景：按缺失槽位拼接追问
+        question = "为了帮您处理售后申请，" + " ".join(ask_map[s] for s in missing if s in ask_map)
     print(f"[Node: ask_user] 第 {rounds} 轮追问: {question}")  # 打印追问内容
 
     history = list(state.get("dialog_history") or [])    # 取出对话历史
@@ -300,14 +412,21 @@ def ask_user_node(state: AfterSalesState) -> Dict[str, Any]:  # 节点1.5：必�
         "missing_slots": missing,                        # 保持缺失清单（下一轮重抽后刷新）
         "slot_rounds": rounds,                           # 累加追问轮数
         "dialog_history": history,                       # 写回含追问的对话历史
+        "slot_error": None,                              # 文案已消费，清除避免污染下一轮
     }
 
 
 def query_order_node(state: AfterSalesState) -> Dict[str, Any]:  # 节点2：调用真实工具查询订单详情
     """
     [节点 2: 查询订单详情]
-    - 调用内置 QueryOrderTool 从 PostgreSQL 真实查询订单数据。
+    - 调用内置 QueryOrderTool 从 PostgreSQL 真实查询订单数据;
+    - 槽位校验阶段已缓存订单详情时跳过重复查询;
+    - 查询失败不再抛异常崩图，转为 RETRY_ASK 回流追问节点（§2.2）。
     """
+    if state.get("order_info"):                          # 意图节点业务校验时已顺带查到并缓存
+        print("[Node: query_order] 订单详情已由槽位校验阶段缓存，跳过重复查询")  # 打印缓存命中日志
+        return {}                                        # 直接透传，进入后续核验链
+
     order_id = state.get("order_id", "")               # 从状态中取出待查询的订单号
     user_id = state.get("user_id", "USR_001")          # 取出用户ID，缺省为演示用户
     print(f"[Node: query_order] 调用 QueryOrderTool 查询订单: {order_id}")  # 打印节点执行轨迹，便于观察流程
@@ -315,8 +434,18 @@ def query_order_node(state: AfterSalesState) -> Dict[str, Any]:  # 节点2：调
     ctx = ToolContext(caller_id="langgraph-aftersales", tenant_id="default", user_id=user_id)  # 构造工具上下文：标记调用方、租户与操作用户
     res = query_order_tool.call({"order_id": order_id}, ctx)  # 同步调用订单查询工具，返回结构化 ToolResult
 
-    if not res.ok:                                     # 工具返回失败标志时
-        raise RuntimeError(f"查询订单失败: {res.error_message}")  # 抛出运行时异常终止本次图执行（错误可被上游捕获）
+    if not res.ok:                                     # 查询失败：收敛为可恢复的追问流程而非崩图
+        print(f"[Node: query_order] 订单查询失败，回流追问: {res.error_message}")  # 打印失败轨迹
+        sv = dict(state.get("slot_values") or {})      # 复制槽位表
+        sv.pop("order_id", None)                       # 剔除失效订单号槽位，等待用户重新提供
+        return {
+            "decision": "RETRY_ASK",                   # 决策标记：由 route_query_order 路由回 ask_user
+            "slot_values": sv,                         # 写回剔除后的槽位表
+            "order_id": None,                          # 顶层镜像同步清空
+            "missing_slots": ["order_id"],             # 标记缺失，驱动追问
+            "slot_error": f"未能查询到订单 {order_id}（{res.error_message}），请核对订单号后重新发送",  # 针对性追问文案
+            "order_validated_id": None,                # 作废校验标记，重新提供后需再次校验
+        }
 
     return {"order_info": res.data}                    # 将查询到的订单数据写入状态的 order_info 字段
 
@@ -357,8 +486,12 @@ def policy_evaluation_node(state: AfterSalesState) -> Dict[str, Any]:  # 节点4
         "reason_type": reason_type                     # 入参：原因大类（质量问题/无理由适用不同规则）
     }, ctx)
 
-    if not res.ok:                                     # 政策查询失败属于关键前置条件缺失
-        raise RuntimeError(f"核对政策失败: {res.error_message}")  # 直接抛异常终止流程
+    if not res.ok:                                     # 政策查询失败属于关键前置条件缺失，但不再裸 raise 崩图（§2.2）
+        print(f"[Node: policy_evaluation] 政策核验失败，转人工: {res.error_message}")  # 打印失败轨迹
+        return {                                       # 收敛为转人工决策，由下游 route_decision 汇入人工节点
+            "decision": "ESCALATE_HUMAN",              # 直接给出决策，condition_decision 节点将透传不覆盖
+            "human_reason": f"售后政策核验服务异常：{res.error_message}，转人工专员处理",  # 记录转人工原因
+        }
 
     return {"policy_rules": res.data}                  # 将政策计算结果（是否可退、自动退款上限等）写入状态
 
@@ -366,8 +499,13 @@ def policy_evaluation_node(state: AfterSalesState) -> Dict[str, Any]:  # 节点4
 def condition_decision_node(state: AfterSalesState) -> Dict[str, Any]:  # 节点5：综合政策与金额做风控决策
     """
     [节点 5: 综合条件判断与决策路由]
-    - 判断是否在有效退换期内，是否超出大额退款阈值。
+    - 判断是否在有效退换期内，是否超出大额退款阈值;
+    - 上游已定 ESCALATE_HUMAN（如政策核验服务异常）时透传，不重新判定。
     """
+    if state.get("decision") == "ESCALATE_HUMAN":      # 上游节点（政策核验失败等）已作出转人工决策
+        print("[Node: condition_decision] 上游已决策转人工，透传跳过风控判定")  # 打印透传轨迹
+        return {}                                      # 状态增量置空，decision/human_reason 原样保留流向路由
+
     policy = state.get("policy_rules") or {}           # 取出政策计算结果
     order_info = state.get("order_info") or {}         # 取出订单详情
     total_amount = float(order_info.get("total_amount", 0.0))  # 订单实付金额，转为浮点数
@@ -523,9 +661,17 @@ def send_notification_node(state: AfterSalesState) -> Dict[str, Any]:  # 节点8
 # ============================================================================
 # 3. 动态条件路由 (Conditional Edge Router)
 # ============================================================================
-def route_slots(state: AfterSalesState) -> Literal["query_order", "ask_user"]:  # 槽位完整性路由：决定继续流程还是向用户追问
+def route_slots(state: AfterSalesState) -> Literal["query_order", "ask_user", "send_notification"]:  # 槽位完整性路由：决定继续流程、追问或越界出口
+    if state.get("decision") == "OUT_OF_SCOPE":          # 越界意图网关命中（§2.3）
+        return "send_notification"                       # 跳过整条售后链，直接发答复通知后结束
     missing = state.get("missing_slots") or []           # 读取必要槽位缺失清单
     return "ask_user" if missing else "query_order"      # 有缺失 -> 追问节点；槽位齐全 -> 查询订单
+
+
+def route_query_order(state: AfterSalesState) -> Literal["check_logistics", "ask_user"]:  # 订单查询结果路由（§2.2 降级边）
+    if state.get("decision") == "RETRY_ASK":             # 查询失败：节点已剔除坏单号并写好 slot_error
+        return "ask_user"                                # 回流追问节点，让用户核对订单号后重新提供
+    return "check_logistics"                             # 查询成功（或校验阶段已缓存）：继续物流核验
 
 
 def route_decision(state: AfterSalesState) -> Literal["execute_action", "human_escalation", "send_notification"]:  # 路由函数：根据决策字段返回下一跳节点名
@@ -563,10 +709,18 @@ def build_aftersales_graph(checkpointer=None):         # 构建并编译售后�
         {
             "query_order": "query_order",              # 槽位齐全 -> 继续订单查询流程
             "ask_user": "ask_user",                    # 槽位缺失 -> 反问用户补槽
+            "send_notification": "send_notification",  # 越界意图 OUT_OF_SCOPE -> 直接答复通知（§2.3）
         }
     )
     workflow.add_edge("ask_user", END)                 # 追问后本轮图执行结束；用户补充信息后同线程重新 invoke 进入下一轮补槽
-    workflow.add_edge("query_order", "check_logistics")     # 查询订单 -> 检查物流
+    workflow.add_conditional_edges(                    # 查询订单后接条件边：失败时回流追问而非崩图（§2.2）
+        "query_order",                                 # 源节点：订单查询
+        route_query_order,                             # 路由函数：RETRY_ASK -> ask_user；正常 -> 物流核验
+        {
+            "check_logistics": "check_logistics",    # 分支映射：订单可用 -> 继续检查物流
+            "ask_user": "ask_user",                   # 分支映射：订单查询失败 -> 针对性追问重新要单号
+        }
+    )
     workflow.add_edge("check_logistics", "policy_evaluation")  # 检查物流 -> 核对政策
     workflow.add_edge("policy_evaluation", "condition_decision")  # 核对政策 -> 风控决策
 

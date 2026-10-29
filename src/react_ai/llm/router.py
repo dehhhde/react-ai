@@ -16,13 +16,14 @@ class LLMRouter(BaseLLMClient):
         tools: Optional[List[ToolDefinition]] = None,
         temperature: float = 0.2,
         max_tokens: Optional[int] = None,
+        tool_choice: Optional[str] = None,
     ) -> LLMResponse:
         clients = [self.primary] + self.fallbacks
         last_error = None
 
         for client in clients:
             try:
-                return await client.generate(messages, tools, temperature, max_tokens)
+                return await client.generate(messages, tools, temperature, max_tokens, tool_choice)
             except Exception as err:
                 last_error = err
                 continue

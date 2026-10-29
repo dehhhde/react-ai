@@ -27,6 +27,7 @@ class DeepSeekProvider(BaseLLMClient):
         tools: Optional[List[ToolDefinition]] = None,
         temperature: float = 0.2,
         max_tokens: Optional[int] = None,
+        tool_choice: Optional[str] = None,
     ) -> LLMResponse:
         url = f"{self.api_base}/chat/completions"
         headers = {
@@ -74,6 +75,9 @@ class DeepSeekProvider(BaseLLMClient):
                 }
                 for t in tools
             ]
+            if tool_choice:
+                # 强制模型调用指定工具, 从协议层保证返回结构化 tool_calls (function calling)
+                payload["tool_choice"] = {"type": "function", "function": {"name": tool_choice}}
 
         async with httpx.AsyncClient(timeout=self.timeout_seconds) as client:
             resp = await client.post(url, headers=headers, json=payload)

@@ -25,10 +25,11 @@ class OpenAIProvider(BaseLLMClient):
         tools: Optional[List[ToolDefinition]] = None,
         temperature: float = 0.2,
         max_tokens: Optional[int] = None,
+        tool_choice: Optional[str] = None,
     ) -> LLMResponse:
         # 1. 若配置了 API Key，发起真实的 HTTP 接口调用
         if self.api_key:
-            return await self._call_real_api(messages, tools, temperature, max_tokens)
+            return await self._call_real_api(messages, tools, temperature, max_tokens, tool_choice)
 
         # 2. 离线无 Key 模式：提供逼真的 ReAct 多步推理与工具调用演示
         return self._simulate_react_step(messages, tools)
@@ -39,6 +40,7 @@ class OpenAIProvider(BaseLLMClient):
         tools: Optional[List[ToolDefinition]] = None,
         temperature: float = 0.2,
         max_tokens: Optional[int] = None,
+        tool_choice: Optional[str] = None,
     ) -> LLMResponse:
         url = f"{self.api_base}/chat/completions"
         headers = {
@@ -81,6 +83,9 @@ class OpenAIProvider(BaseLLMClient):
                 }
                 for t in tools
             ]
+            if tool_choice:
+                # 强制模型调用指定工具, 从协议层保证返回结构化 tool_calls (function calling)
+                payload["tool_choice"] = {"type": "function", "function": {"name": tool_choice}}
 
         async with httpx.AsyncClient(timeout=60.0) as client:
             resp = await client.post(url, headers=headers, json=payload)

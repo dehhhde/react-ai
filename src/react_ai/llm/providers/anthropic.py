@@ -16,6 +16,7 @@ class AnthropicProvider(BaseLLMClient):
         tools: Optional[List[ToolDefinition]] = None,
         temperature: float = 0.2,
         max_tokens: Optional[int] = None,
+        tool_choice: Optional[str] = None,
     ) -> LLMResponse:
         return LLMResponse(
             content=f"[Anthropic {self.model}]: Claude 推理完成。",

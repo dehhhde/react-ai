@@ -36,7 +36,9 @@
 
 ## 2. 企业级差距分析（按重要性排序）
 
-### 2.1 抽取可靠性 —— 提示词 JSON → 协议层结构化输出
+### 2.1 抽取可靠性 —— 提示词 JSON → 协议层结构化输出 ✅ 已实现
+
+> **状态更新（2026-10-29）**：本节改造已落地。`BaseLLMClient.generate`/`LLMRouter`/`DeepSeekProvider`/`OpenAIProvider`/`AnthropicProvider` 新增 `tool_choice` 参数（OpenAI 协议 `{"type":"function","function":{"name":...}}` 强制调用）；示例中以 `SLOT_TOOL`（`ToolDefinition`+`ToolParameterSchema`）声明槽位 Schema，`extract_slots_via_llm()` 首选消费 `LLMResponse.tool_calls[0].arguments`，正文 JSON 解析降级为回退路径，Pydantic 校验保留为第二道防线。以下为原差距分析。
 
 **现状**：靠系统提示词约束模型"只输出 JSON"，再用 `_extract_json()` 从文本中抢救 JSON。模型可能输出解释性文字、代码围栏、半截 JSON，解析规则永远在打补丁。
 
@@ -72,13 +74,15 @@ slots = json.loads(resp.tool_calls[0].arguments)   # 协议保证是合法 JSON 
 validated = SlotExtractionResult.model_validate(slots)   # Schema 校验保留作第二道防线
 ```
 
-> ⚠️ 前置依赖：本项目 `DeepSeekProvider/OpenAIProvider` 目前为骨架实现，`tool_calls` 的透传与解析需先补全并实测（见 [LLM-Gateway.md](file:///d:/code/react-ai/wiki/LLM-Gateway.md)）。
+> ~~⚠️ 前置依赖：Provider 为骨架实现，tool_calls 需先补全~~ 已随本次改造验证：`DeepSeekProvider/OpenAIProvider` 的 tools 透传与 tool_calls 解析可用，`tool_choice` 强制调用已补齐。
 
 **验收标准**：构造 50 条含干扰话术的样本，抽取结构合法率 100%（协议保证）+ 语义正确率 ≥ 95%；`_extract_json` 的容错分支仅作为旧路径回归保留。
 
 ---
 
-### 2.2 槽位业务校验 —— 格式合法 ≠ 业务可用
+### 2.2 槽位业务校验 —— 格式合法 ≠ 业务可用 ✅ 已实现
+
+> **状态更新（2026-10-29）**：本节改造已落地。`AfterSalesState` 新增 `order_validated_id`/`slot_error` 字段；`validate_order_slot()` 在意图节点对**新出现或变更**的订单号做存在性+归属权双重校验（复用 `QueryOrderTool`，以 `state.user_id` 核验归属），失败即剔除槽位、重算 `missing_slots` 并携带针对性话术，经 `route_slots` 自然回流 `ask_user`（话术优先于通用补槽提问，消费后清除）；校验通过则缓存 `order_info` 供 `query_order` 节点免二次查询。全图消灭节点裸 `raise`：`query_order` 失败产出 `RETRY_ASK` 经新增条件边 `route_query_order` 回流追问；`policy_evaluation` 失败产出 `ESCALATE_HUMAN`，`condition_decision` 增加透传守卫。mock 工具单测覆盖不存在单号/他人订单/查询失败/政策服务异常四类场景，图均不崩溃。以下为原差距分析。
 
 **现状**：`order_id` 只做正则格式校验（`^[A-Za-z0-9_\-]{4,64}$`）。用户填错单号、填**别人的订单号**，都会一路走到 `query_order` 节点然后 `raise RuntimeError` **崩掉整张图**。
 
@@ -105,7 +109,9 @@ def validate_order_slot(order_id, user_id) -> str | None:
 
 ---
 
-### 2.3 越界意图处理 —— 缺少 OTHER 出口
+### 2.3 越界意图处理 —— 缺少 OTHER 出口 ✅ 已实现
+
+> **状态更新（2026-10-29）**：本节改造已落地。`SlotExtractionResult`、`SLOT_TOOL` 协议层枚举与抽取提示词三处同步加入 `OTHER`；关键词降级规则在完全无售后信号（无退/换/质量/无理由/订单号线索）时判 `OTHER`，有线索但无动作词仍置 None 交追问；`intent_recognition_node` 在槽位合并后、业务校验前增设越界网关——意图槽位首次即为 `OTHER` 时短路返回 `decision=OUT_OF_SCOPE` + 友好话术，清空 `missing_slots` 防误触补槽追问，不触发任何售后工具；`route_slots` 增加第三分支将 OUT_OF_SCOPE 直送 `send_notification` 结束。已确认售后意图的会话不被后续 OTHER 覆盖打断。单测验证：非售后话术（查天气/问客服电话）100% 走越界出口，零售后写操作。以下为原差距分析。
 
 **现状**：意图枚举只有 `RETURN_AND_REFUND / REFUND_ONLY / EXCHANGE`。用户说"帮我查天气""你们客服电话多少"，会被关键词降级规则硬塞成 `RETURN_AND_REFUND`，进入完整售后流程。
 
