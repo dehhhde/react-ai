@@ -135,7 +135,9 @@ if slots.get("intent") == "OTHER":
 
 ---
 
-### 2.4 安全护栏 —— 用户原文直入 LLM
+### 2.4 安全护栏 —— 用户原文直入 LLM ✅ 已实现
+
+> **状态更新（2026-10-29）**：本节改造已落地。示例中构建 `slot_guard_chain`（`GuardrailChain(short_circuit=True)` + `PromptInjectionGuardrail` + `PIIMaskingGuardrail`），`intent_recognition_node` 入口处对本轮 `user_message` 同步 `check`（携带 session/user 上下文与 INPUT 方向）：命中注入即 BLOCK 短路——零 LLM/零售后工具调用，产出 `decision=ESCALATE_HUMAN` + 审计原因，注入原文不写入 `dialog_history`（防二次注入），`route_slots` 新增第四分支直送 `human_escalation`；PII 命中则 MODIFY，**只有脱敏后文本**进入对话历史与 LLM。落实"入模型脱敏、入数据库原文"双轨：关键词降级与订单号业务校验始终基于原文。单测验证：中英文注入样本全部 BLOCK；含手机号/身份证样本发往 LLM 的 messages 无裸 PII（`[PHONE_MASKED]`/`[ID_MASKED]` 占位），订单号原值照常通过 §2.2 校验。以下为原差距分析。
 
 **现状**：`user_message` 与历史对话未经任何检查直接拼进提示词。项目 `guardrails` 模块已有现成组件但本示例未接入。
 
@@ -167,7 +169,9 @@ safe_text = guard.modified_content or user_msg               # 用脱敏后文�
 
 ---
 
-### 2.5 异步兼容 —— `asyncio.run()` 在服务内直接报错
+### 2.5 异步兼容 —— `asyncio.run()` 在服务内直接报错 ✅ 已实现
+
+> **状态更新（2026-10-29）**：本节改造已落地。`intent_recognition_node` 改为原生 `async def`，内部直接 `await extract_slots_via_llm(history)`，删除节点内 `asyncio.run` 重入调用；演示入口改为 `async def main_async()` + `await app.ainvoke(...)`，同步桥接仅保留脚本入口 `asyncio.run(main_async())` 一处（全文件唯一）。工具节点保持同步 `.call()`——LangGraph 在 `ainvoke` 时自动将同步节点调度到线程池，混图无阻塞。护栏 `GuardrailChain.check` 为同步接口，在异步节点内直接调用（本就设计为可安全同步调用）。单测验证：在已运行事件循环内直接 `await` 意图节点无 `RuntimeError`；并发 20 会话 `ainvoke`（mock LLM/工具）全部走通至 `RETURN_SHIPPING`；同线程多轮补槽异步路径正常。以下为原差距分析。
 
 **现状**：LLM 抽槽用 `asyncio.run(extract_slots_via_llm(...))` 同步驱动。在 FastAPI/uvicorn 的已运行事件循环内调用会抛 `RuntimeError: asyncio.run() cannot be called from a running event loop`——即**本图目前只能离线脚本跑，挂不进 API 服务**。
 
@@ -190,7 +194,7 @@ LangGraph 完整支持异步节点与 `await app.ainvoke(...)`；同步脚本入
 
 ---
 
-### 2.6 会话持久化 —— MemorySaver 重启即失忆
+### 2.6 会话持久化 —— MemorySaver 重启即失忆 ✅ 已实现
 
 **现状**：文件头声称"支持挂载 PostgreSQL Checkpointer"，但 `main()` 实际挂的是 `MemorySaver()`（内存）。
 
@@ -210,6 +214,10 @@ async with AsyncPostgresSaver.from_conn_string(settings.database_url) as saver:
 `thread_id` 命名规范建议 `{tenant}:{user}:{session}`，与项目会话键 `{tenant_id}:{session_id}` 约定对齐（见 [Memory.md](file:///d:/code/react-ai/wiki/Memory.md)）。追问轮次 `slot_rounds`、`dialog_history` 随检查点持久化后，3 轮上限才真正生效。
 
 **验收标准**：服务重启后，用原 `thread_id` 继续补槽可成功续跑；两实例负载均衡下多轮会话状态一致。
+
+> **状态更新（已实现）**：示例新增 `open_checkpointer()` 异步上下文工厂——优先挂载 `AsyncPostgresSaver.from_conn_string(settings.database.url)`（连接串追加 `connect_timeout=3`，PG 缺席时 3 秒内快速降级 `MemorySaver` 并打印告警，不阻塞演示），`setup()` 幂等建表，`with` 退出自动释放连接池。`main_async()` 全部用例改经该工厂构图，`thread_id` 采用 `{tenant}:{user}:{session}` 命名（如 `default:USR_002:SESS_TEST_002`），与项目会话键约定对齐。
+> 验证：模拟重启测试通过——实例 A 追问中断后，全新编译的实例 B 以同一 `thread_id` 补槽续跑至 `RETURN_SHIPPING`，第 1 轮的 intent/对话历史/追问轮次全部经检查点恢复，证明图状态无检查点之外的隐藏依赖。
+> **平台注意**：psycopg3 异步模式不兼容 Windows 默认 `ProactorEventLoop`，脚本入口已改用 `asyncio.run(..., loop_factory=SelectorEventLoop)`；Linux 生产环境无此问题。真实"跨进程重启续跑"需 PG 实例（本地 5433 不可达时自动走内存降级）。
 
 ---
 
@@ -232,3 +240,4 @@ async with AsyncPostgresSaver.from_conn_string(settings.database_url) as saver:
 - 护栏组件：[guardrails/injection.py](file:///d:/code/react-ai/src/react_ai/guardrails/injection.py)、[guardrails/pii.py](file:///d:/code/react-ai/src/react_ai/guardrails/pii.py)、[guardrails/base.py](file:///d:/code/react-ai/src/react_ai/guardrails/base.py)（`GuardrailChain`）
 - 意图路由（长期方向）：[orchestration/router.py](file:///d:/code/react-ai/src/react_ai/orchestration/router.py)（`IntentRoute`）
 - 延伸阅读：[LLM-Gateway.md](file:///d:/code/react-ai/wiki/LLM-Gateway.md) · [Guardrails.md](file:///d:/code/react-ai/wiki/Guardrails.md) · [Orchestration.md](file:///d:/code/react-ai/wiki/Orchestration.md) · [Architecture.md](file:///d:/code/react-ai/wiki/Architecture.md)
+- 后续演进：六项差距已全部落地后，第二轮优化（评测集、可观测性、置信度、换意图、输出护栏）见 [Intent-Recognition-Optimization.md](file:///d:/code/react-ai/wiki/Intent-Recognition-Optimization.md)

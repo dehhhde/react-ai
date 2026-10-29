@@ -14,7 +14,8 @@
    - SendNotificationTool (send_notification): 发送用户短信/站内信
    - EscalateToHumanTool (escalate_to_human): 转人工审核并写入待办工单
 3. 条件路由 (Conditional Edges): 根据政策合规性与金额风控分流至自动执行或人工介入。
-4. 持久化支持 (PostgreSQL Checkpointer): 支持挂载基于 PG 的状态持久化与断点续跑。
+4. 持久化支持 (PostgreSQL Checkpointer): 挂载 AsyncPostgresSaver 持久化检查点（§2.6），
+   追问中的会话状态跨进程重启、跨多实例存活；PG 不可用时降级 MemorySaver 并告警。
 5. LLM 意图识别与槽位填充 (Slot Filling): 引入真实大模型 (项目内置 LLMRouter) 从用户
    自然语言中抽取意图/订单号/原因等槽位; 采用 function calling (SLOT_TOOL + tool_choice)
    从协议层保证结构化输出, LLM 输出再经 Pydantic Schema (SlotExtractionResult) 强校验
@@ -24,13 +25,20 @@
    剔除槽位并携带针对性话术回流追问; 查询/政策节点失败不再裸 raise 崩图, 分别降级为
    RETRY_ASK 回流追问与 ESCALATE_HUMAN 透传转人工; 意图枚举含 OTHER, 非售后诉求经
    越界意图网关短路为 OUT_OF_SCOPE 出口直接答复, 不触发任何售后工具写操作。
+   输入安全护栏 (GuardrailChain): 用户原文进 LLM 前先过注入检测 (命中 BLOCK 直接转人工,
+   不进模型不进售后链) 与 PII 脱敏 (手机号/身份证掩码后才发往模型); 采用"入模型脱敏、
+   入数据库原文"双轨——关键词降级与业务校验始终基于原文订单号。
+6. 异步兼容 (Async Native): LLM 意图节点为原生 async def + await, 图可经 `ainvoke` 直接
+   挂入 FastAPI 等已运行事件循环的服务内并发执行, 无 asyncio.run 重入错误; 同步桥接仅保留
+   在脚本入口 `asyncio.run(main_async())` 一处。
 """
 
 import sys                                              # 导入系统模块，用于操作 Python 解释器的模块搜索路径
-import asyncio                                           # 导入异步运行时模块，用于在同步示例脚本中驱动异步 LLM 调用
+import asyncio                                           # 导入异步运行时模块，仅用于脚本入口 asyncio.run(main_async()) 一处桥接
 import json                                             # 导入 JSON 编解码模块，用于解析 LLM 输出的槽位 JSON
 import re                                                # 导入正则模块，用于关键词降级时从文本中提取订单号
 import uuid                                             # 导入通用唯一标识符模块，用于生成幂等键、运单号等随机ID
+from contextlib import asynccontextmanager              # 导入异步上下文管理器装饰器，用于封装 PG 检查点的连接生命周期
 from pathlib import Path                                # 导入路径对象类，用于跨平台地解析文件/目录路径
 from typing import Dict, Any, Optional, Literal, List   # 导入类型注解工具：字典、任意类型、可选类型、字面量枚举类型、列表
 from typing_extensions import TypedDict                 # 导入 TypedDict，用类型字典形式定义 LangGraph 的状态结构
@@ -41,6 +49,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))  # 把�
 
 from langgraph.graph import StateGraph, START, END      # 导入 LangGraph 状态图构建器及图的虚拟起点/终点标记
 from langgraph.checkpoint.memory import MemorySaver     # 导入内存版检查点存储器，用于按 thread_id 持久化图执行状态
+from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver  # 导入 PG 异步检查点（§2.6）：会话状态跨进程重启/多实例持久化
 
 # 导入本项目的 LLM 网关与配置，用于真实大模型意图识别
 from react_ai.config import settings                     # 导入全局配置单例：从环境变量/.env 读取 LLM 密钥、模型名等
@@ -49,6 +58,11 @@ from react_ai.llm.router import LLMRouter               # 导入 LLM 路由器�
 from react_ai.llm.providers.deepseek import DeepSeekProvider  # 导入 DeepSeek 客户端（OpenAI 兼容协议，默认主模型）
 from react_ai.llm.providers.openai import OpenAIProvider  # 导入 OpenAI 客户端（备用降级目标）
 from react_ai.schemas.tools import ToolDefinition, ToolParameterSchema  # 导入工具定义与参数 Schema 模型，用于 function calling 结构化抽槽
+
+# 导入安全护栏组件：输入侧注入检测 + PII 脱敏（§2.4）
+from react_ai.guardrails.base import GuardrailChain, GuardrailAction, GuardrailContext, GuardrailDirection  # 护栏链、动作枚举、检查上下文与方向枚举
+from react_ai.guardrails.injection import PromptInjectionGuardrail  # 提示词注入/越狱特征检测护栏
+from react_ai.guardrails.pii import PIIMaskingGuardrail             # 手机号/身份证正则脱敏护栏
 
 # 导入本项目已定义好的电商售后工具与上下文
 from react_ai.tools.base import ToolContext             # 导入工具执行上下文（携带调用方、租户、用户、幂等键等信息）
@@ -143,6 +157,12 @@ SLOT_TOOL = ToolDefinition(
 )
 
 _SLOT_KEYS = {"intent", "order_id", "reason", "reason_type", "missing_slots"}  # 合法槽位键集合，用于甄别模拟/异常返回的 tool_calls 参数
+
+# 抽槽输入护栏链（§2.4）：用户原文进 LLM 前必须先过安全护栏。
+# 短路策略：注入检测命中即 BLOCK（后续护栏不再跑）；PII 命中则 MODIFY 产出脱敏文本继续放行。
+slot_guard_chain = GuardrailChain(name="slot_input_chain", short_circuit=True)   # 构建抽槽入口专用护栏链
+slot_guard_chain.add_guardrail(PromptInjectionGuardrail())                        # 第一道：提示词注入/越狱检测 -> BLOCK 阻断
+slot_guard_chain.add_guardrail(PIIMaskingGuardrail())                             # 第二道：手机号/身份证 -> 正则掩码脱敏
 
 
 def get_llm_router() -> LLMRouter:                     # 懒加载构建 LLM 路由器
@@ -283,7 +303,7 @@ def validate_order_slot(order_id: str, user_id: str) -> tuple:  # 槽位业务�
     return None, res.data                                # 校验通过，顺带返回订单详情供缓存复用
 
 
-def intent_recognition_node(state: AfterSalesState) -> Dict[str, Any]:  # 节点1：调用真实 LLM 从多轮对话中抽取意图与槽位，累积合并并计算缺失必要槽位
+async def intent_recognition_node(state: AfterSalesState) -> Dict[str, Any]:  # 节点1（异步）：调用真实 LLM 从多轮对话中抽取意图与槽位，累积合并并计算缺失必要槽位
     """
     [节点 1: LLM 意图识别与槽位填充]
     - 携带对话历史调用 LLM 抽取 intent/order_id/reason/reason_type 槽位;
@@ -291,14 +311,40 @@ def intent_recognition_node(state: AfterSalesState) -> Dict[str, Any]:  # 节点
     - 必要槽位缺失时不写死兜底，而是交由 ask_user 节点反问用户补槽。
     """
     user_msg = state.get("user_message", "")             # 本轮用户输入（补槽轮次里就是用户对追问的回答）
+
+    # ---- 输入安全护栏（§2.4）：注入阻断、PII 脱敏，脱敏文本才发往 LLM ----
+    guard = slot_guard_chain.check(                      # 同步检查本轮用户原文（GuardrailChain.check 可在任意节点安全调用）
+        user_msg,
+        GuardrailContext(                                # 检查上下文：链路追踪 + 会话/用户归属 + 输入方向
+            request_id=state.get("session_id", ""),      # 以会话ID作请求追踪标识
+            session_id=state.get("session_id", ""),      # 会话ID
+            user_id=state.get("user_id"),                # 操作用户
+            direction=GuardrailDirection.INPUT,          # 输入侧检查（PII 身份证规则仅输入方向生效）
+        ),
+    )
+    if guard.action == GuardrailAction.BLOCK:            # 命中注入/越狱特征：不进 LLM、不进售后流程，直接转人工
+        hit = guard.violations[0].description if guard.violations else "安全规则"  # 取首条违规描述用于审计说明
+        print(f"[Node: intent_recognition] 护栏阻断: {hit}")  # 打印阻断轨迹（违规原文不落入对话历史，防二次注入）
+        return {
+            "intent": state.get("intent"),               # 保留已确认意图，不覆盖
+            "slot_values": dict(state.get("slot_values") or {}),  # 槽位表原样保留
+            "missing_slots": [],                         # 清空缺失，防止误触补槽追问
+            "dialog_history": list(state.get("dialog_history") or []),  # 历史不含注入原文
+            "decision": "ESCALATE_HUMAN",                # 越狱输入交人工甄别，route_slots 走人工分支
+            "human_reason": f"用户输入触发安全护栏（{hit}），转人工核实真实诉求",  # 审计用转人工原因
+            "slot_error": None,                          # 无业务校验错误
+            "final_reply": "您的消息触发了系统安全检查，已转人工专员继续为您处理售后诉求。",  # 用户侧友好话术
+        }
+    safe_msg = guard.modified_content or user_msg        # MODIFY 时为 PII 脱敏后文本；ALLOW 时即原文——只有脱敏文本才进模型
+
     history = list(state.get("dialog_history") or [])    # 取出多轮对话历史，首轮为空列表
     if user_msg:                                         # 本轮有新输入
-        history.append({"role": "user", "content": user_msg})  # 追加进对话历史，供 LLM 结合上下文抽取
+        history.append({"role": "user", "content": safe_msg})  # 追加脱敏后文本进对话历史，供 LLM 结合上下文抽取（§2.4 入模型脱敏）
 
-    slots = asyncio.run(extract_slots_via_llm(history))  # 同步示例脚本内驱动异步 LLM 调用（生产 async 服务中应直接 await）
+    slots = await extract_slots_via_llm(history)         # 原生异步 await（§2.5）：节点置于 FastAPI 等已运行事件循环内可直接 ainvoke，不再 asyncio.run 重入报错
     source = "LLM"                                       # 标记槽位来源为真实大模型
     if slots is None:                                    # LLM 调用或解析失败
-        slots = fallback_extract_slots(user_msg)         # 降级为关键词规则抽取
+        slots = fallback_extract_slots(user_msg)         # 降级为关键词规则抽取——双轨原则：规则用原文，抽出的订单号原值送业务校验（入数据库原文）
         slots = SlotExtractionResult(**slots).model_dump(exclude_none=True)  # 规则输出同样过 Pydantic Schema 归一化，保证两路输出契约一致
         source = "关键词降级"                            # 标记来源为兜底规则
 
@@ -661,9 +707,11 @@ def send_notification_node(state: AfterSalesState) -> Dict[str, Any]:  # 节点8
 # ============================================================================
 # 3. 动态条件路由 (Conditional Edge Router)
 # ============================================================================
-def route_slots(state: AfterSalesState) -> Literal["query_order", "ask_user", "send_notification"]:  # 槽位完整性路由：决定继续流程、追问或越界出口
+def route_slots(state: AfterSalesState) -> Literal["query_order", "ask_user", "send_notification", "human_escalation"]:  # 槽位完整性路由：决定继续流程、追问、越界出口或护栏转人工
     if state.get("decision") == "OUT_OF_SCOPE":          # 越界意图网关命中（§2.3）
         return "send_notification"                       # 跳过整条售后链，直接发答复通知后结束
+    if state.get("decision") == "ESCALATE_HUMAN":        # 输入触发安全护栏（§2.4），意图节点已短路定责
+        return "human_escalation"                        # 直接转人工甄别，不进 LLM 抽槽与售后链
     missing = state.get("missing_slots") or []           # 读取必要槽位缺失清单
     return "ask_user" if missing else "query_order"      # 有缺失 -> 追问节点；槽位齐全 -> 查询订单
 
@@ -710,6 +758,7 @@ def build_aftersales_graph(checkpointer=None):         # 构建并编译售后�
             "query_order": "query_order",              # 槽位齐全 -> 继续订单查询流程
             "ask_user": "ask_user",                    # 槽位缺失 -> 反问用户补槽
             "send_notification": "send_notification",  # 越界意图 OUT_OF_SCOPE -> 直接答复通知（§2.3）
+            "human_escalation": "human_escalation",    # 护栏阻断 ESCALATE_HUMAN -> 直接转人工（§2.4）
         }
     )
     workflow.add_edge("ask_user", END)                 # 追问后本轮图执行结束；用户补充信息后同线程重新 invoke 进入下一轮补槽
@@ -744,58 +793,102 @@ def build_aftersales_graph(checkpointer=None):         # 构建并编译售后�
 
 
 # ============================================================================
+# 4.5 会话持久化 (Checkpointer 工厂, §2.6)
+# ============================================================================
+def _pg_conn_string() -> str:                            # 组装 PG 连接串：复用项目数据库配置并加短连接超时
+    """在 settings.database.url 上追加 connect_timeout，避免 PG 不可达时长时间挂起。"""
+    url = settings.database.url                          # 项目统一数据库连接串（与售后工具共用同一 PG 实例）
+    sep = "&" if "?" in url else "?"                     # 判断连接串是否已带查询参数，选择正确的拼接分隔符
+    return f"{url}{sep}connect_timeout=3"                # 3 秒连接超时：PG 缺席时快速失败并降级，而非阻塞演示
+
+
+@asynccontextmanager                                     # 封装为异步上下文管理器：saver 连接随 with 块自动建立与释放
+async def open_checkpointer():                           # 创建图检查点：优先 PG 持久化，不可用时降级内存（§2.6）
+    """会话持久化工厂。
+
+    AsyncPostgresSaver 把每个 thread_id 的图状态（对话历史/槽位/追问轮次/待中断位置）
+    写入 PG checkpoint 表：进程重启后追问到一半的会话可原样续跑，多实例负载均衡下
+    任意实例都能接管同一会话——修复 MemorySaver '重启即失忆' 问题。
+    PG 不可达（本地开发/故障）时降级 MemorySaver 并打印告警，演示不中断。
+    """
+    cm = None                                            # 持有 from_conn_string 返回的异步上下文管理器句柄
+    try:
+        cm = AsyncPostgresSaver.from_conn_string(_pg_conn_string())  # 惰性创建 PG 连接池上下文（尚未真正连接）
+        saver = await cm.__aenter__()                    # 进入上下文：建立连接，得到可用的 AsyncPostgresSaver
+        try:
+            await saver.setup()                          # 幂等建表：首次运行自动创建 checkpoint/checkpoint_blobs 等表
+            print("[持久化] AsyncPostgresSaver 已挂载：会话状态跨重启/多实例存活")  # 打印持久化模式提示
+            yield saver                                  # 把 saver 交给 with 块使用（build_aftersales_graph 参数）
+        finally:
+            await cm.__aexit__(None, None, None)         # 退出时释放 PG 连接池，防止连接泄漏
+    except Exception as exc:                             # 连接失败/建表失败/PG 缺席：走内存降级
+        print(f"[持久化] PG 不可用（{type(exc).__name__}: {exc}），降级 MemorySaver："
+              f"进程重启后追问中的会话将丢失，仅限本地演示")  # 显式告警，防止误把内存模式当生产配置
+        yield MemorySaver()                              # 内存检查点：行为与旧版一致，保证演示可离线跑通
+
+
+# ============================================================================
 # 5. 主程序运行演示 (执行真实数据库与真实工具调用)
 # ============================================================================
-def main():                                            # 演示入口：构建图并跑三个典型业务用例（含多轮槽位补全）
+async def main_async():                                  # 异步演示入口：构建图并跑三个典型业务用例（含多轮槽位补全）；服务内可直接 await 本函数图对象，无需任何桥接
     print("=" * 75)                                    # 打印分隔线
     print(">>> 启动 LangGraph 电商售后工单工作流 (真实 LLM 意图识别 + 槽位填充 + 缺失追问) <<<")  # 打印标题说明
     print("=" * 75)                                    # 打印分隔线
 
-    app = build_aftersales_graph(checkpointer=MemorySaver())  # 编译图应用，使用内存检查点按 thread_id 隔离会话状态
+    async with open_checkpointer() as checkpointer:    # §2.6: 优先挂载 AsyncPostgresSaver（跨重启/多实例持久化），PG 不可用时自动降级 MemorySaver
+        app = build_aftersales_graph(checkpointer=checkpointer)  # 编译图应用，按 thread_id 隔离并持久化会话状态
 
-    # Case 1: 完整诉求（一句话给全意图/原因/订单号）-> LLM 一次抽槽直接跑通流程
-    case1_input: AfterSalesState = {                   # 构造用例1的初始状态（类型标注为售后状态字典）
-        "session_id": "SESS_TEST_001",                 # 会话ID
-        "user_id": "USR_001",                          # 用户ID
-        "user_message": "我买的衣服破了，要退货退款，订单号是 ORD_CLOTH_001",  # 槽位信息齐全，LLM 可一次抽取完整
-    }
+        # thread_id 命名规范 {tenant}:{user}:{session}（§2.6）：与项目会话键约定对齐，
+        # 同一会话无论落到哪个服务实例、进程是否重启，都定位到同一份持久化检查点
+        # Case 1: 完整诉求（一句话给全意图/原因/订单号）-> LLM 一次抽槽直接跑通流程
+        case1_input: AfterSalesState = {               # 构造用例1的初始状态（类型标注为售后状态字典）
+            "session_id": "SESS_TEST_001",             # 会话ID
+            "user_id": "USR_001",                      # 用户ID
+            "user_message": "我买的衣服破了，要退货退款，订单号是 ORD_CLOTH_001",  # 槽位信息齐全，LLM 可一次抽取完整
+        }
 
-    print("\n--- [测试用例 1: 完整诉求 -> LLM 一次抽槽自动通过] ---")  # 打印用例标题
-    res1 = app.invoke(case1_input, config={"configurable": {"thread_id": "THREAD_001"}})  # 同步执行整张图；thread_id 用于检查点会话隔离
-    print(f"最终决策: {res1.get('decision')}")         # 打印决策结果（预期 RETURN_SHIPPING）
-    print(f"客户回复:\n{res1.get('final_reply')}")     # 打印给用户的最终答复文本
+        print("\n--- [测试用例 1: 完整诉求 -> LLM 一次抽槽自动通过] ---")  # 打印用例标题
+        res1 = await app.ainvoke(case1_input, config={"configurable": {"thread_id": "default:USR_001:SESS_TEST_001"}})  # 异步执行整张图（§2.5）；thread_id 即持久化会话主键
+        print(f"最终决策: {res1.get('decision')}")     # 打印决策结果（预期 RETURN_SHIPPING）
+        print(f"客户回复:\n{res1.get('final_reply')}") # 打印给用户的最终答复文本
 
-    # Case 2: 必要槽位缺失 -> ask_user 追问 -> 用户补充 -> 同一线程续跑（多轮槽位填充）
-    print("\n\n--- [测试用例 2: 槽位缺失追问演示: 信息不全 -> 系统反问 -> 用户补充 -> 继续处理] ---")  # 打印用例标题
-    cfg2 = {"configurable": {"thread_id": "THREAD_002"}}  # 用例2跨轮共用同一 thread_id，依赖检查点携带槽位与对话历史状态
-    res2a = app.invoke({                               # 第1轮：用户只说想退货，缺少原因大类与订单号
-        "session_id": "SESS_TEST_002",                 # 会话ID
-        "user_id": "USR_002",                          # 用户ID
-        "user_message": "我想退货",                    # 缺失 reason_type / order_id 必要槽位 -> 触发追问
-    }, config=cfg2)
-    print(f"[第1轮] 已抽槽位: intent={res2a.get('intent')}, reason_type={res2a.get('reason_type')}, order_id={res2a.get('order_id')}; 缺失={res2a.get('missing_slots')}")  # 打印第1轮槽位填充情况
-    print(f"[第1轮] 系统追问: {res2a.get('final_reply')}")  # 打印追问话术（本轮流程在 ask_user 后结束）
+        # Case 2: 必要槽位缺失 -> ask_user 追问 -> 用户补充 -> 同一线程续跑（多轮槽位填充）
+        print("\n\n--- [测试用例 2: 槽位缺失追问演示: 信息不全 -> 系统反问 -> 用户补充 -> 继续处理] ---")  # 打印用例标题
+        cfg2 = {"configurable": {"thread_id": "default:USR_002:SESS_TEST_002"}}  # 用例2跨轮共用同一 thread_id；挂载 PG 检查点后，第2轮请求即使打到另一实例/重启后的进程也能续跑
+        res2a = await app.ainvoke({                    # 第1轮：用户只说想退货，缺少原因大类与订单号
+            "session_id": "SESS_TEST_002",             # 会话ID
+            "user_id": "USR_002",                      # 用户ID
+            "user_message": "我想退货",                # 缺失 reason_type / order_id 必要槽位 -> 触发追问
+        }, config=cfg2)
+        print(f"[第1轮] 已抽槽位: intent={res2a.get('intent')}, reason_type={res2a.get('reason_type')}, order_id={res2a.get('order_id')}; 缺失={res2a.get('missing_slots')}")  # 打印第1轮槽位填充情况
+        print(f"[第1轮] 系统追问: {res2a.get('final_reply')}")  # 打印追问话术（本轮流程在 ask_user 后结束）
 
-    res2b = app.invoke({                               # 第2轮：用户回答追问补充槽位，同一线程从检查点恢复上下文续跑
-        "session_id": "SESS_TEST_002",                 # 会话ID
-        "user_id": "USR_002",                          # 用户ID
-        "user_message": "衣服质量有问题，订单号 ORD_CLOTH_001",  # 结合对话历史，LLM 抽取剩余缺失槽位后流程继续
-    }, config=cfg2)
-    print(f"[第2轮] 最终决策: {res2b.get('decision')}")  # 打印最终决策（补槽成功后预期 RETURN_SHIPPING）
-    print(f"[第2轮] 客户回复:\n{res2b.get('final_reply')}")  # 打印补槽完成后的业务处理结果
+        res2b = await app.ainvoke({                    # 第2轮：用户回答追问补充槽位，同一线程从检查点恢复上下文续跑
+            "session_id": "SESS_TEST_002",             # 会话ID
+            "user_id": "USR_002",                      # 用户ID
+            "user_message": "衣服质量有问题，订单号 ORD_CLOTH_001",  # 结合对话历史，LLM 抽取剩余缺失槽位后流程继续
+        }, config=cfg2)
+        print(f"[第2轮] 最终决策: {res2b.get('decision')}")  # 打印最终决策（补槽成功后预期 RETURN_SHIPPING）
+        print(f"[第2轮] 客户回复:\n{res2b.get('final_reply')}")  # 打印补槽完成后的业务处理结果
 
-    # Case 3: 大额黄金订单退款 (槽位齐全但金额超限 -> 触发转人工审核)
-    case3_input: AfterSalesState = {                   # 构造用例3的初始状态
-        "session_id": "SESS_TEST_003",                 # 会话ID
-        "user_id": "USR_003",                          # 用户ID
-        "user_message": "黄金手链断了，要求退款，订单号 ORD_LUXURY_005",  # 槽位齐全；金额超出自动审核上限
-    }
+        # Case 3: 大额黄金订单退款 (槽位齐全但金额超限 -> 触发转人工审核)
+        case3_input: AfterSalesState = {               # 构造用例3的初始状态
+            "session_id": "SESS_TEST_003",             # 会话ID
+            "user_id": "USR_003",                      # 用户ID
+            "user_message": "黄金手链断了，要求退款，订单号 ORD_LUXURY_005",  # 槽位齐全；金额超出自动审核上限
+        }
 
-    print("\n\n--- [测试用例 3: 黄金手链金额超限 -> 转人工专员审核 (HITL)] ---")  # 打印用例标题
-    res3 = app.invoke(case3_input, config={"configurable": {"thread_id": "THREAD_003"}})  # 以独立线程执行用例3
-    print(f"最终决策: {res3.get('decision')}")         # 打印决策结果（预期 ESCALATE_HUMAN）
-    print(f"客户回复:\n{res3.get('final_reply')}")     # 打印含工单号的转人工答复
+        print("\n\n--- [测试用例 3: 黄金手链金额超限 -> 转人工专员审核 (HITL)] ---")  # 打印用例标题
+        res3 = await app.ainvoke(case3_input, config={"configurable": {"thread_id": "default:USR_003:SESS_TEST_003"}})  # 以独立线程异步执行用例3
+        print(f"最终决策: {res3.get('decision')}")     # 打印决策结果（预期 ESCALATE_HUMAN）
+        print(f"客户回复:\n{res3.get('final_reply')}") # 打印含工单号的转人工答复
 
 
 if __name__ == "__main__":                             # 脚本直接运行时执行主函数（被导入时不自动运行）
-    main()                                             # 启动售后工作流演示
+    if sys.platform == "win32":                        # Windows 平台特殊处理（§2.6）：psycopg3 异步模式不兼容默认的
+        import selectors                               # ProactorEventLoop，须显式提供 Selector 型事件循环工厂，否则
+        _loop_factory = lambda: asyncio.SelectorEventLoop(  # AsyncPostgresSaver 连接时报 "cannot use ProactorEventLoop"
+            selectors.SelectSelector())                # 而永远落入内存降级（Linux 生产环境默认即兼容，无需处理）
+        asyncio.run(main_async(), loop_factory=_loop_factory)  # 事件循环工厂方式，避开已弃用的 set_event_loop_policy
+    else:
+        asyncio.run(main_async())                      # 全图异步执行；asyncio.run 仅在此脚本入口出现一次（§2.5），挂进 API 服务时由事件循环直接 ainvoke

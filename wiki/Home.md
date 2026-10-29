@@ -33,6 +33,7 @@
 | [Orchestration](Orchestration.md) | `react_ai.orchestration` / `react_ai.flows` | 多智能体编排器、Supervisor、意图路由、状态图工作流、BaseFlow 流程管道 |
 | [Guardrails](Guardrails.md) | `react_ai.guardrails` | Prompt 注入拦截、PII 脱敏、合规审核、护栏组合链 |
 | [Intent-Recognition](Intent-Recognition.md) | `examples/aftersales_langgraph.py` | 意图识别与槽位填充现状评估、企业级差距分析与改造路线（补充文档） |
+| [Intent-Recognition-Optimization](Intent-Recognition-Optimization.md) | `examples/aftersales_langgraph.py` | 第二轮优化方案：评测集/可观测性/置信度/换意图/输出护栏（规划文档） |
 
 ### 支撑服务与接入
 
