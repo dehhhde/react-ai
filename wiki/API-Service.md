@@ -27,6 +27,14 @@ K8s 存活/就绪探针：
 {"status": "ok", "service": "react-ai"}
 ```
 
+### GET /metrics
+
+Prometheus 抓取端点，`text/plain; version=0.0.4`，正文由 `metrics.to_prometheus_text()` 生成——带标签计数器原样导出，直方图按 `summary` 导出 p50/p95/p99 与 `_sum`/`_count`（§2.3 六类指标见 [Observability](Observability.md)）。
+
+### GET /metrics/snapshot
+
+同一份指标的 JSON 形态（`metrics.snapshot()`），便于调试与临时取数。
+
 ### POST /api/v1/agent/chat
 
 同步阻塞对话，内部调用 `agent.run()`，返回聚合 `AgentResponse`：

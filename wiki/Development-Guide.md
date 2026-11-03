@@ -25,7 +25,7 @@ assert result.wasSuccessful()
 "
 ```
 
-单元测试通过 **Mock LLM 客户端**（实现 `BaseLLMClient.generate` 返回预置 `LLMResponse`/`tool_calls`）实现纯单机、零网络依赖的 ReAct 状态机闭环验证。现有用例覆盖：引擎、工具、护栏、记忆、编排、流程、事件、Agent、提示词、售后工具、base_model_client 等（见 [tests/unit/](file:///d:/code/react-ai/tests/unit)）。
+单元测试通过 **Mock LLM 客户端**（实现 `BaseLLMClient.generate` 返回预置 `LLMResponse`/`tool_calls`）实现纯单机、零网络依赖的 ReAct 状态机闭环验证。现有用例覆盖：引擎、工具、护栏、记忆、编排、流程、事件、Agent、提示词、售后工具、base_model_client、可观测性（`test_observability.py` / `test_aftersales_observability.py`：指标标签与分位数、Prometheus 文本、日志必带 `thread_id`、同线程串行化并发度恒为 1）等（见 [tests/unit/](file:///d:/code/react-ai/tests/unit)）。
 
 ## 示例脚本
 
@@ -33,13 +33,20 @@ assert result.wasSuccessful()
 |---|---|
 | [examples/quickstart.py](../examples/quickstart.py) | DeepSeek 驱动的最小 ReAct Agent + 全生命周期事件打印 |
 | [examples/flow_demo.py](../examples/flow_demo.py) | `BaseFlow` 订单履约流程：条件步骤、重试、同步/异步混合 |
-| [examples/aftersales_langgraph.py](../examples/aftersales_langgraph.py) | LangGraph 集成 + 售后业务 Agent 全链路 |
+| [examples/aftersales_langgraph.py](../examples/aftersales_langgraph.py) | LangGraph 集成 + 售后业务 Agent 全链路；9 个节点统一经 `instrument_node` 埋点（结构化日志按 `thread_id` 串联 + 六类指标），结尾打印指标报告；日志级别与会话锁开关见 `LOG_LEVEL` / `ENABLE_SESSION_LOCK` |
 
 均可直接 `python examples/xxx.py` 运行（脚本自动把 `src/` 注入 `sys.path`）。
 
 ## scripts/ 维护脚本
 
-`scripts/` 为一次性运维/脚手架脚本：`init_aftersales_db.py`（初始化售后 PostgreSQL 库）、`build_memory.py`、`update_settings.py` 等历史补丁脚本。新环境搭建仅需 `init_aftersales_db.py`。
+`scripts/` 既有历史一次性补丁脚本（`init_aftersales_db.py` 初始化售后 PostgreSQL 库、`build_memory.py`、`update_settings.py`），也有持续使用的验证驱动：
+
+| 脚本 | 用途 |
+|---|---|
+| `scripts/live_e2e_verify.py turn` | 真实链路单轮驱动（§2.2）：`--user/--session/--msg` 在指定 `thread_id` 上执行一轮，经 `ainvoke_serialized` 走会话串行化，旁路记录抽槽来源（`--stats`）与结果 JSON（`--out`） |
+| `scripts/live_e2e_verify.py fork-check` | 会话串行化验收（§2.3）：`--thread <thread_id>` 输出 `{heads, linear_history, fork_metric_total}`，检查点分叉时退出码 1 |
+
+新环境搭建仅需 `init_aftersales_db.py`。
 
 ## 扩展开发规范
 

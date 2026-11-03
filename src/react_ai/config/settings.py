@@ -53,6 +53,36 @@ class ObservabilityConfig(BaseSettings):
     enable_tracing: bool = Field(default=True, alias="ENABLE_TRACING")
     log_level: str = Field(default="INFO", alias="LOG_LEVEL")
     otlp_endpoint: str | None = Field(default=None, alias="OTEL_EXPORTER_OTLP_ENDPOINT")
+    enable_session_lock: bool = Field(default=True, alias="ENABLE_SESSION_LOCK")
+    session_lock_timeout_seconds: float = Field(default=30.0, alias="SESSION_LOCK_TIMEOUT")
+
+
+class IntentConfidenceConfig(BaseSettings):
+    """意图置信度阈值策略（第二轮方案 §3.1）.
+
+    阈值默认值来自 eval/datasets/intent_slots.jsonl 全量标注集上的标定，
+    不是拍脑袋：改阈值必须重跑 `python eval/run_intent_eval.py --confidence-report`。
+    """
+
+    enabled: bool = Field(default=True, alias="INTENT_CONFIDENCE_ENABLED")
+    high_threshold: float = Field(default=0.8, alias="INTENT_CONFIDENCE_HIGH")
+    low_threshold: float = Field(default=0.5, alias="INTENT_CONFIDENCE_LOW")
+
+
+class IntentFlowConfig(BaseSettings):
+    """中途换意图与流程挂起策略（第二轮方案 §3.2）.
+
+    min_switch_confidence 是"把用户已填的槽位埋进挂起栈"的最低证据门槛：低于它一律
+    按补充旧流程处理，因为误判一次切换的代价（丢失已收集信息）远高于漏判一次。
+    该值须由 `py eval/run_intent_eval.py --category flow_switch` 标定后再动。
+    """
+
+    enabled: bool = Field(default=True, alias="INTENT_FLOW_ENABLED")
+    min_switch_confidence: float = Field(default=0.7, alias="INTENT_FLOW_MIN_SWITCH_CONFIDENCE")
+    max_pending_flows: int = Field(default=2, alias="INTENT_FLOW_MAX_PENDING")
+    # 会话级补槽预算：单流程仍有各自的 3 轮上限，本项约束整段会话被反问的总次数，
+    # 防止在两三个流程间反复切换把追问轮次刷成无底洞
+    max_session_slot_rounds: int = Field(default=6, alias="INTENT_FLOW_MAX_SESSION_ROUNDS")
 
 
 class DatabaseConfig(BaseSettings):
@@ -83,6 +113,8 @@ class AppSettings(BaseSettings):
     memory: MemoryConfig = Field(default_factory=MemoryConfig)
     security: SecurityConfig = Field(default_factory=SecurityConfig)
     observability: ObservabilityConfig = Field(default_factory=ObservabilityConfig)
+    intent: IntentConfidenceConfig = Field(default_factory=IntentConfidenceConfig)
+    flow: IntentFlowConfig = Field(default_factory=IntentFlowConfig)
 
     model_config = SettingsConfigDict(
         env_file=".env", env_file_encoding="utf-8", extra="ignore"

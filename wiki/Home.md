@@ -33,13 +33,15 @@
 | [Orchestration](Orchestration.md) | `react_ai.orchestration` / `react_ai.flows` | 多智能体编排器、Supervisor、意图路由、状态图工作流、BaseFlow 流程管道 |
 | [Guardrails](Guardrails.md) | `react_ai.guardrails` | Prompt 注入拦截、PII 脱敏、合规审核、护栏组合链 |
 | [Intent-Recognition](Intent-Recognition.md) | `examples/aftersales_langgraph.py` | 意图识别与槽位填充现状评估、企业级差距分析与改造路线（补充文档） |
-| [Intent-Recognition-Optimization](Intent-Recognition-Optimization.md) | `examples/aftersales_langgraph.py` | 第二轮优化方案：评测集/可观测性/置信度/换意图/输出护栏（规划文档） |
+| [Intent-Recognition-Optimization](Intent-Recognition-Optimization.md) | `examples/aftersales_langgraph.py` | 第二轮优化方案：评测集/真实链路验证/可观测性与会话串行化已落地，置信度/换意图/输出护栏待实施（规划文档） |
+| [Intent-Recognition-E2E-Report](Intent-Recognition-E2E-Report.md) | `scripts/live_e2e_verify.py` | 真实 LLM + PG 链路端到端验证记录：三用例收敛、跨进程续跑、抽槽来源统计、检查点分叉缺陷与修复复验 |
 
 ### 支撑服务与接入
 
 | 页面 | 模块 | 内容 |
 |---|---|---|
 | [Observability](Observability.md) | `react_ai.observability` | OpenTelemetry 追踪、结构化 JSON 日志、Metrics 度量 |
+| [Observability Data Catalog](Observability-Data-Catalog.md) | `react_ai.observability` / `examples/aftersales_langgraph.py` | 观测数据落在哪里、观测哪些指标/日志事件、采集时机与口径限制、常用查询速查表 |
 | [Prompts](Prompts.md) | `react_ai.prompts` | PromptManager、Jinja2 模板、企业标准 ReAct 提示词 |
 | [API Service](API-Service.md) | `api/` | FastAPI REST 端点与 SSE 流式协议 |
 | [Development Guide](Development-Guide.md) | `tests/` `examples/` | 测试套件、示例脚本、扩展开发指南 |

@@ -14,6 +14,7 @@ AppSettings
 ├── llm:          LLMConfig
 ├── memory:       MemoryConfig
 ├── security:     SecurityConfig
+├── intent:       IntentConfidenceConfig
 ├── observability: ObservabilityConfig
 └── database:     DatabaseConfig
 ```
@@ -51,13 +52,25 @@ AppSettings
 | `TOOL_TIMEOUT` | `max_tool_execution_timeout` | `30.0` | 工具执行最大超时（秒） |
 | `SANDBOX_MODE` | `sandbox_mode` | `strict` | 沙箱模式 |
 
+## IntentConfidenceConfig（意图置信度阈值，第二轮方案 §3.1）
+
+| 环境变量 | 字段 | 默认值 | 说明 |
+|---|---|---|---|
+| `INTENT_CONFIDENCE_ENABLED` | `enabled` | `True` | 阈值策略开关。关闭时仍记录自评分与落段（只观测不拦截），用于灰度与回滚 |
+| `INTENT_CONFIDENCE_HIGH` | `high_threshold` | `0.8` | ≥ 该值直接进售后链；默认值来自评测集标定，改阈值须重跑 `py eval/run_intent_eval.py --confidence-report` |
+| `INTENT_CONFIDENCE_LOW` | `low_threshold` | `0.5` | < 该值作废意图槽位并回落到"您要办哪一种"的补槽追问（超过补槽轮次上限才升级人工） |
+
+`[LOW, HIGH)` 之间为"中置信段"：槽位齐全时先反问确认意图（`您是要办理【退货退款】吗？`），仍缺槽则本轮先补槽（落段 `mid_deferred`）。消费方为 [examples/aftersales_langgraph.py](file:///d:/code/react-ai/examples/aftersales_langgraph.py) 的 `intent_recognition_node`。
+
 ## ObservabilityConfig（可观测性）
 
 | 环境变量 | 字段 | 默认值 | 说明 |
 |---|---|---|---|
 | `ENABLE_TRACING` | `enable_tracing` | `True` | 是否启用链路追踪 |
-| `LOG_LEVEL` | `log_level` | `INFO` | 日志级别 |
+| `LOG_LEVEL` | `log_level` | `INFO` | 日志级别（真实作用于 `StructuredLogger` 底层 handler） |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | `otlp_endpoint` | `None` | OTLP 导出端点 |
+| `ENABLE_SESSION_LOCK` | `enable_session_lock` | `True` | 同一 `thread_id` 会话级串行化（进程内排队 + PG advisory lock），关闭后并发轮次可能使检查点分叉 |
+| `SESSION_LOCK_TIMEOUT` | `session_lock_timeout_seconds` | `30.0` | 取 advisory lock 的最大等待秒数，超时则打 `session_lock_degraded` 并降级放行（不拒绝用户） |
 
 ## DatabaseConfig（业务数据库）
 
