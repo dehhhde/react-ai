@@ -15,13 +15,14 @@ import logging
 import uuid
 from datetime import datetime, timezone
 from decimal import Decimal
-from typing import Any, Optional
+from typing import Any, Literal, Optional
 
 import psycopg
 from psycopg.rows import dict_row
+from pydantic import Field
 
 from react_ai.config.settings import settings
-from react_ai.tools.base import BaseTool, ToolContext
+from react_ai.tools.base import BaseTool, ToolContext, ToolInputModel
 
 logger = logging.getLogger(__name__)
 
@@ -39,6 +40,13 @@ def _serialize(obj: Any) -> Any:
     return obj
 
 
+def _mask_phone(phone: str | None) -> str | None:
+    """手机号脱敏：保留前 3 后 4，中间用 * 替代，防止 PII 明文进入模型上下文."""
+    if not phone or not isinstance(phone, str) or len(phone) < 7:
+        return phone
+    return f"{phone[:3]}****{phone[-4:]}"
+
+
 class AfterSalesBaseTool(BaseTool):
     """电商售后工具基类，封装通用数据库访问与序列化能力."""
 
@@ -52,6 +60,11 @@ class AfterSalesBaseTool(BaseTool):
         return psycopg.connect(target_url, row_factory=dict_row)
 
 
+class QueryOrderInput(ToolInputModel):
+    order_id: Optional[str] = Field(default=None, description="订单号，例如 ORD_CLOTH_001")
+    user_id: Optional[str] = Field(default=None, description="用户ID，例如 USR_001")
+
+
 class QueryOrderTool(AfterSalesBaseTool):
     """根据订单号或用户ID查询订单详情、状态、金额、购买时间."""
 
@@ -59,17 +72,7 @@ class QueryOrderTool(AfterSalesBaseTool):
     description = "根据订单号或用户ID查询订单详情、状态、金额、购买支付时间、签收时间及商品项明细。"
     side_effects = "read"
     tags = ["order", "aftersales", "query"]
-
-    @property
-    def input_schema(self) -> dict:
-        return {
-            "type": "object",
-            "properties": {
-                "order_id": {"type": "string", "description": "订单号，例如 ORD_CLOTH_001"},
-                "user_id": {"type": "string", "description": "用户ID，例如 USR_001"},
-            },
-            "additionalProperties": False,
-        }
+    input_model = QueryOrderInput
 
     def execute(self, arguments: dict, ctx: ToolContext) -> Any:
         order_id = arguments.get("order_id")
@@ -116,6 +119,11 @@ class QueryOrderTool(AfterSalesBaseTool):
                     })
 
 
+class QueryLogisticsInput(ToolInputModel):
+    tracking_number: Optional[str] = Field(default=None, description="物流运单号，如 SF10010001")
+    order_id: Optional[str] = Field(default=None, description="订单号，如 ORD_TRANSIT_006")
+
+
 class QueryLogisticsTool(AfterSalesBaseTool):
     """查询物流轨迹，判断是否已发货、是否可拦截."""
 
@@ -123,17 +131,7 @@ class QueryLogisticsTool(AfterSalesBaseTool):
     description = "查询物流轨迹与状态，判断包裹是否已发货以及是否支持拦截。"
     side_effects = "read"
     tags = ["logistics", "aftersales", "query"]
-
-    @property
-    def input_schema(self) -> dict:
-        return {
-            "type": "object",
-            "properties": {
-                "tracking_number": {"type": "string", "description": "物流运单号，如 SF10010001"},
-                "order_id": {"type": "string", "description": "订单号，如 ORD_TRANSIT_006"},
-            },
-            "additionalProperties": False,
-        }
+    input_model = QueryLogisticsInput
 
     def execute(self, arguments: dict, ctx: ToolContext) -> Any:
         tracking_number = arguments.get("tracking_number")
@@ -175,6 +173,17 @@ class QueryLogisticsTool(AfterSalesBaseTool):
                 })
 
 
+class SearchPolicyInput(ToolInputModel):
+    category: Optional[Literal["CLOTHING", "FRESH_FOOD", "DIGITAL", "LUXURY"]] = Field(
+        default=None, description="商品品类，如 CLOTHING, FRESH_FOOD, DIGITAL, LUXURY"
+    )
+    order_id: Optional[str] = Field(default=None, description="关联订单号，用于查询签收时长")
+    item_id: Optional[str] = Field(default=None, description="关联商品项ID，用于获取品类和签收时间")
+    reason_type: Literal["no_reason", "quality_issue"] = Field(
+        default="no_reason", description="退换原因类型：no_reason (无理由退货) 或 quality_issue (质量问题)"
+    )
+
+
 class SearchPolicyTool(AfterSalesBaseTool):
     """检索售后政策，判断该商品是否在退货期内、是否符合退货条件."""
 
@@ -182,27 +191,7 @@ class SearchPolicyTool(AfterSalesBaseTool):
     description = "检索售后政策，判断该商品是否在退货期内、是否符合退货条件。"
     side_effects = "read"
     tags = ["policy", "aftersales", "query"]
-
-    @property
-    def input_schema(self) -> dict:
-        return {
-            "type": "object",
-            "properties": {
-                "category": {
-                    "type": "string",
-                    "description": "商品品类，如 CLOTHING, FRESH_FOOD, DIGITAL, LUXURY",
-                    "enum": ["CLOTHING", "FRESH_FOOD", "DIGITAL", "LUXURY"],
-                },
-                "order_id": {"type": "string", "description": "关联订单号，用于查询签收时长"},
-                "item_id": {"type": "string", "description": "关联商品项ID，用于获取品类和签收时间"},
-                "reason_type": {
-                    "type": "string",
-                    "description": "退换原因类型：no_reason (无理由退货) 或 quality_issue (质量问题)",
-                    "enum": ["no_reason", "quality_issue"],
-                },
-            },
-            "additionalProperties": False,
-        }
+    input_model = SearchPolicyInput
 
     def execute(self, arguments: dict, ctx: ToolContext) -> Any:
         category = arguments.get("category")
@@ -295,6 +284,11 @@ class SearchPolicyTool(AfterSalesBaseTool):
                 })
 
 
+class QueryUserHistoryInput(ToolInputModel):
+    user_id: str = Field(description="用户ID，如 USR_001")
+    time_range_days: int = Field(default=90, ge=1, le=365, description="查询时间范围天数，默认 90 天")
+
+
 class QueryUserHistoryTool(AfterSalesBaseTool):
     """查询用户近期投诉与退款记录，计算退款比例，识别恶意行为."""
 
@@ -302,23 +296,7 @@ class QueryUserHistoryTool(AfterSalesBaseTool):
     description = "查询用户近期投诉/退款记录，识别恶意退款或高风险行为。"
     side_effects = "read"
     tags = ["user", "aftersales", "risk"]
-
-    @property
-    def input_schema(self) -> dict:
-        return {
-            "type": "object",
-            "properties": {
-                "user_id": {"type": "string", "description": "用户ID，如 USR_001"},
-                "time_range_days": {
-                    "type": "integer",
-                    "description": "查询时间范围天数，默认 90 天",
-                    "minimum": 1,
-                    "maximum": 365,
-                },
-            },
-            "required": ["user_id"],
-            "additionalProperties": False,
-        }
+    input_model = QueryUserHistoryInput
 
     def execute(self, arguments: dict, ctx: ToolContext) -> Any:
         user_id = arguments["user_id"]
@@ -368,7 +346,7 @@ class QueryUserHistoryTool(AfterSalesBaseTool):
                 return _serialize({
                     "user_id": user_id,
                     "username": user["username"],
-                    "phone": user["phone"],
+                    "phone": _mask_phone(user["phone"]),
                     "vip_level": user["vip_level"],
                     "time_range_days": days,
                     "total_orders": total_orders,
@@ -383,6 +361,16 @@ class QueryUserHistoryTool(AfterSalesBaseTool):
                 })
 
 
+class CreateRefundInput(ToolInputModel):
+    order_id: str = Field(description="订单号")
+    item_id: str = Field(description="申请退款的商品项ID")
+    refund_amount: float = Field(gt=0, description="退款金额")
+    reason: str = Field(description="退款原因")
+    refund_type: Optional[Literal["REFUND_ONLY", "RETURN_AND_REFUND"]] = Field(
+        default=None, description="退款类型：REFUND_ONLY (仅退款), RETURN_AND_REFUND (退货退款)"
+    )
+
+
 class CreateRefundTool(AfterSalesBaseTool):
     """发起退款，需幂等键和金额上限校验."""
 
@@ -390,25 +378,7 @@ class CreateRefundTool(AfterSalesBaseTool):
     description = "发起退款申请，需幂等键和金额上限校验。根据品类限额自动核准或转入待审核工单。"
     side_effects = "write"
     tags = ["refund", "aftersales", "write"]
-
-    @property
-    def input_schema(self) -> dict:
-        return {
-            "type": "object",
-            "properties": {
-                "order_id": {"type": "string", "description": "订单号"},
-                "item_id": {"type": "string", "description": "申请退款的商品项ID"},
-                "refund_amount": {"type": "number", "description": "退款金额", "minimum": 0.01},
-                "reason": {"type": "string", "description": "退款原因"},
-                "refund_type": {
-                    "type": "string",
-                    "description": "退款类型：REFUND_ONLY (仅退款), RETURN_AND_REFUND (退货退款)",
-                    "enum": ["REFUND_ONLY", "RETURN_AND_REFUND"],
-                },
-            },
-            "required": ["order_id", "item_id", "refund_amount", "reason"],
-            "additionalProperties": False,
-        }
+    input_model = CreateRefundInput
 
     def execute(self, arguments: dict, ctx: ToolContext) -> Any:
         order_id = arguments["order_id"]
@@ -498,6 +468,13 @@ class CreateRefundTool(AfterSalesBaseTool):
                 })
 
 
+class CreateExchangeOrderInput(ToolInputModel):
+    order_id: str = Field(description="原订单号")
+    item_id: str = Field(description="原商品项ID")
+    target_sku_id: str = Field(description="换货目标SKU ID，如 SKU_1001_M")
+    reason: str = Field(description="换货原因")
+
+
 class CreateExchangeOrderTool(AfterSalesBaseTool):
     """创建换货单，需校验库存."""
 
@@ -505,20 +482,7 @@ class CreateExchangeOrderTool(AfterSalesBaseTool):
     description = "创建换货单，校验原商品与目标SKU库存，生成换货申请工单。"
     side_effects = "write"
     tags = ["exchange", "aftersales", "write"]
-
-    @property
-    def input_schema(self) -> dict:
-        return {
-            "type": "object",
-            "properties": {
-                "order_id": {"type": "string", "description": "原订单号"},
-                "item_id": {"type": "string", "description": "原商品项ID"},
-                "target_sku_id": {"type": "string", "description": "换货目标SKU ID，如 SKU_1001_M"},
-                "reason": {"type": "string", "description": "换货原因"},
-            },
-            "required": ["order_id", "item_id", "target_sku_id", "reason"],
-            "additionalProperties": False,
-        }
+    input_model = CreateExchangeOrderInput
 
     def execute(self, arguments: dict, ctx: ToolContext) -> Any:
         order_id = arguments["order_id"]
@@ -580,6 +544,12 @@ class CreateExchangeOrderTool(AfterSalesBaseTool):
                 })
 
 
+class InterceptShipmentInput(ToolInputModel):
+    tracking_number: Optional[str] = Field(default=None, description="运单号")
+    order_id: Optional[str] = Field(default=None, description="订单号")
+    reason: str = Field(description="拦截原因")
+
+
 class InterceptShipmentTool(AfterSalesBaseTool):
     """拦截已发货包裹，需调用物流系统."""
 
@@ -587,19 +557,7 @@ class InterceptShipmentTool(AfterSalesBaseTool):
     description = "拦截已发货包裹，更新物流状态并记录拦截原因。包裹已签收则拒绝拦截。"
     side_effects = "write"
     tags = ["logistics", "aftersales", "intercept", "write"]
-
-    @property
-    def input_schema(self) -> dict:
-        return {
-            "type": "object",
-            "properties": {
-                "tracking_number": {"type": "string", "description": "运单号"},
-                "order_id": {"type": "string", "description": "订单号"},
-                "reason": {"type": "string", "description": "拦截原因"},
-            },
-            "required": ["reason"],
-            "additionalProperties": False,
-        }
+    input_model = InterceptShipmentInput
 
     def execute(self, arguments: dict, ctx: ToolContext) -> Any:
         tracking_number = arguments.get("tracking_number")
@@ -652,6 +610,14 @@ class InterceptShipmentTool(AfterSalesBaseTool):
                 })
 
 
+class SendNotificationInput(ToolInputModel):
+    user_id: str = Field(description="接收通知的用户ID")
+    title: str = Field(description="通知标题")
+    content: str = Field(description="通知内容")
+    channel: Literal["IN_APP", "SMS"] = Field(default="IN_APP", description="通知渠道：IN_APP 或 SMS，默认 IN_APP")
+    ticket_id: Optional[str] = Field(default=None, description="关联的工单号（可选）")
+
+
 class SendNotificationTool(AfterSalesBaseTool):
     """向用户发送处理结果通知."""
 
@@ -659,25 +625,7 @@ class SendNotificationTool(AfterSalesBaseTool):
     description = "向用户发送处理结果通知，支持站内信 (IN_APP) 与短信 (SMS) 渠道。"
     side_effects = "write"
     tags = ["notification", "aftersales", "write"]
-
-    @property
-    def input_schema(self) -> dict:
-        return {
-            "type": "object",
-            "properties": {
-                "user_id": {"type": "string", "description": "接收通知的用户ID"},
-                "title": {"type": "string", "description": "通知标题"},
-                "content": {"type": "string", "description": "通知内容"},
-                "channel": {
-                    "type": "string",
-                    "description": "通知渠道：IN_APP 或 SMS，默认 IN_APP",
-                    "enum": ["IN_APP", "SMS"],
-                },
-                "ticket_id": {"type": "string", "description": "关联的工单号（可选）"},
-            },
-            "required": ["user_id", "title", "content"],
-            "additionalProperties": False,
-        }
+    input_model = SendNotificationInput
 
     def execute(self, arguments: dict, ctx: ToolContext) -> Any:
         user_id = arguments["user_id"]
@@ -716,6 +664,17 @@ class SendNotificationTool(AfterSalesBaseTool):
                 })
 
 
+class EscalateToHumanInput(ToolInputModel):
+    order_id: str = Field(description="订单号")
+    reason: str = Field(description="转人工原因")
+    context_summary: str = Field(description="打包的上下文摘要与诊断信息")
+    priority: Literal["LOW", "NORMAL", "HIGH", "URGENT"] = Field(
+        default="NORMAL", description="优先级：LOW, NORMAL, HIGH, URGENT，默认 NORMAL"
+    )
+    item_id: Optional[str] = Field(default=None, description="涉及的商品项ID（可选）")
+    ticket_id: Optional[str] = Field(default=None, description="已有工单号（可选）")
+
+
 class EscalateToHumanTool(AfterSalesBaseTool):
     """无法自动处理时，打包上下文转人工."""
 
@@ -723,26 +682,7 @@ class EscalateToHumanTool(AfterSalesBaseTool):
     description = "无法自动处理时，打包上下文转交人工客服，生成或更新转人工工单。"
     side_effects = "write"
     tags = ["escalation", "aftersales", "human", "write"]
-
-    @property
-    def input_schema(self) -> dict:
-        return {
-            "type": "object",
-            "properties": {
-                "order_id": {"type": "string", "description": "订单号"},
-                "reason": {"type": "string", "description": "转人工原因"},
-                "context_summary": {"type": "string", "description": "打包的上下文摘要与诊断信息"},
-                "priority": {
-                    "type": "string",
-                    "description": "优先级：LOW, NORMAL, HIGH, URGENT，默认 NORMAL",
-                    "enum": ["LOW", "NORMAL", "HIGH", "URGENT"],
-                },
-                "item_id": {"type": "string", "description": "涉及的商品项ID（可选）"},
-                "ticket_id": {"type": "string", "description": "已有工单号（可选）"},
-            },
-            "required": ["order_id", "reason", "context_summary"],
-            "additionalProperties": False,
-        }
+    input_model = EscalateToHumanInput
 
     def execute(self, arguments: dict, ctx: ToolContext) -> Any:
         order_id = arguments["order_id"]

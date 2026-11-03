@@ -13,6 +13,10 @@ class AgentConfig(BaseModel):
     enable_stream: bool = True
     stop_words: List[str] = Field(default_factory=list)
     system_prompt_override: Optional[str] = None
+    # 工具失败回环：连续失败熔断阈值，避免模型在错误路径上无限循环
+    max_consecutive_tool_failures: int = 3
+    # retryable 错误的自动重试次数（含首次执行）
+    tool_retry_attempts: int = 2
 
 
 class StepResult(BaseModel):
@@ -33,3 +37,5 @@ class AgentResponse(BaseModel):
     usage: UsageStats = Field(default_factory=UsageStats)
     success: bool = True
     error_message: Optional[str] = None
+    status: str = "completed"
+    pending_approval_ids: List[str] = Field(default_factory=list)

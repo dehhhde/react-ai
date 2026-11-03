@@ -1,4 +1,4 @@
-from react_ai.tools.base import BaseTool, ToolContext, ToolResult, FunctionTool, tool
+from react_ai.tools.base import BaseTool, ToolContext, ToolResult, FunctionTool, tool, ToolInputModel
 from react_ai.tools.registry import ToolRegistry
 from react_ai.tools.sandbox import ToolSandbox
 from react_ai.tools.builtin import SafeBashTool, HttpTool, KnowledgeRetrievalTool
@@ -21,6 +21,7 @@ __all__ = [
     "ToolResult",
     "FunctionTool",
     "tool",
+    "ToolInputModel",
     "ToolRegistry",
     "ToolSandbox",
     "SafeBashTool",

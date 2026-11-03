@@ -13,8 +13,12 @@ class AgentEventType(str, Enum):
     TOOL_START = "tool_start"
     TOOL_END = "tool_end"
     TOOL_ERROR = "tool_error"
+    TOOL_APPROVAL_REQUIRED = "tool_approval_required"
+    TOOL_APPROVAL_DECISION = "tool_approval_decision"
     OBSERVATION = "observation"
     MESSAGE_CHUNK = "message_chunk"
+    RUN_PAUSED = "run_paused"
+    RUN_RESUMED = "run_resumed"
     RUN_END = "run_end"
     ERROR = "error"
 

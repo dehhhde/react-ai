@@ -3,6 +3,8 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import PlainTextResponse
 from api.routes.agent import router as agent_router
+from api.routes.approvals import router as approvals_router
+from api.routes.observability import router as observability_router
 from react_ai.observability import metrics
 
 app = FastAPI(
@@ -20,6 +22,8 @@ app.add_middleware(
 )
 
 app.include_router(agent_router)
+app.include_router(approvals_router)
+app.include_router(observability_router)
 
 
 @app.get("/health")

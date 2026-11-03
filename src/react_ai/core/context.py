@@ -12,6 +12,8 @@ class RunContext(BaseModel):
     budget_tokens: int = Field(default=100_000, description="本轮运行最大Token预算")
     used_tokens: int = Field(default=0, description="已消耗Token数")
     is_cancelled: bool = Field(default=False, description="协作式取消信号")
+    is_paused: bool = Field(default=False, description="HITL 审批挂起信号")
+    pending_approval_ids: list = Field(default_factory=list, description="挂起等待决策的审批单ID")
 
     def cancel(self) -> None:
         self.is_cancelled = True

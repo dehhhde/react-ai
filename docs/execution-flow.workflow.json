@@ -1,0 +1,111 @@
+{
+  "schema_version": 2,
+  "diagram_type": "workflow",
+  "meta": {
+    "title": "react-ai 当前执行流程",
+    "locale": "zh-CN",
+    "quality_profile": "showcase",
+    "animation": "none",
+    "views": [
+      {
+        "id": "main-chain",
+        "label": "售后图主链",
+        "focus": ["user", "intent", "order", "logistics", "policy", "decision", "execute", "notify"],
+        "note": "槽位齐全时一条会话请求在图内的完整走向。"
+      },
+      {
+        "id": "slot-loop",
+        "label": "多轮补槽回路",
+        "focus": ["intent", "ask", "user", "order"],
+        "note": "缺槽与坏订单号如何回流到同一 thread_id。"
+      },
+      {
+        "id": "side-path",
+        "label": "ReAct 平行入口",
+        "focus": ["api", "react"],
+        "note": "api/ 目录的服务路径，当前与状态机图无调用关系。"
+      }
+    ]
+  },
+  "lanes": [
+    { "id": "sidepath", "label": "平行入口：FastAPI + ReAct（api/）" },
+    { "id": "nlu", "label": "会话入口 · ① 意图识别 · 补槽回路" },
+    { "id": "chain", "label": "②③④ 业务核验链 · ⑤ 风控决策" },
+    { "id": "exit", "label": "⑥ 写操作 · 人工接管 · 统一出口", "variant": "exception" }
+  ],
+  "phases": [
+    { "id": "intake", "label": "入口 · 抽取", "fromCol": 0, "toCol": 1 },
+    { "id": "check", "label": "核验 · 风控", "fromCol": 2, "toCol": 4, "variant": "emphasis" },
+    { "id": "action", "label": "执行 · 出口", "fromCol": 5, "toCol": 5, "variant": "dashed" }
+  ],
+  "mainPath": ["user", "intent", "order", "logistics", "policy", "decision", "execute", "notify"],
+  "semanticChecks": {
+    "allowedRoots": ["api", "user"],
+    "allowedTerminals": ["react", "notify"],
+    "requiredPaths": [
+      { "from": "user", "to": "notify" },
+      { "from": "intent", "to": "ask" },
+      { "from": "decision", "to": "human" }
+    ]
+  },
+  "nodes": [
+    { "id": "api", "lane": "sidepath", "col": 0, "type": "frontend", "label": "chat 接口", "sublabel": "/agent/chat", "tag": "SSE", "width": 124 },
+    { "id": "react", "lane": "sidepath", "col": 3, "type": "backend", "label": "ReActAgent", "sublabel": "thought→tool→obs", "tag": "10 工具", "width": 124 },
+    { "id": "user", "lane": "nlu", "col": 0, "type": "external", "label": "用户消息", "sublabel": "user_message", "tag": "thread_id", "width": 124 },
+    { "id": "intent", "lane": "nlu", "col": 1, "type": "backend", "label": "intent_recognition", "sublabel": "SLOT_TOOL 抽槽", "tag": "含护栏+校验", "width": 148 },
+    { "id": "ask", "lane": "nlu", "col": 2, "type": "frontend", "label": "ask_user", "sublabel": "slot_error 优先", "tag": "超 3 轮转人工", "width": 124 },
+    { "id": "order", "lane": "chain", "col": 1, "type": "backend", "label": "query_order", "sublabel": "QueryOrderTool", "tag": "失败回流", "width": 124 },
+    { "id": "logistics", "lane": "chain", "col": 2, "type": "backend", "label": "check_logistics", "sublabel": "QueryLogistics", "tag": "失败容错", "width": 124 },
+    { "id": "policy", "lane": "chain", "col": 3, "type": "backend", "label": "policy_evaluation", "sublabel": "SearchPolicyTool", "tag": "失败转人工", "width": 124 },
+    { "id": "decision", "lane": "chain", "col": 4, "type": "security", "label": "condition_decision", "sublabel": "政策+金额", "tag": "REJECTED", "width": 124 },
+    { "id": "human", "lane": "exit", "col": 3, "type": "security", "label": "human_escalation", "sublabel": "EscalateTool", "width": 124 },
+    { "id": "execute", "lane": "exit", "col": 4, "type": "backend", "label": "execute_action", "sublabel": "CreateRefund", "tag": "寄件模拟", "width": 124 },
+    { "id": "notify", "lane": "exit", "col": 5, "type": "messagebus", "label": "send_notification", "sublabel": "NotifyTool", "tag": "→ END", "width": 124 }
+  ],
+  "edges": [
+    { "id": "http-loop", "from": "api", "to": "react", "label": "run", "variant": "emphasis", "role": "main" },
+    { "id": "invoke", "from": "user", "to": "intent", "label": "ainvoke", "variant": "emphasis", "role": "main" },
+    { "id": "slots-missing", "from": "intent", "to": "ask", "label": "缺槽", "variant": "default", "role": "branch" },
+    { "id": "resume", "from": "ask", "to": "user", "label": "续跑", "variant": "dashed", "role": "return", "route": "up-channel", "fromSide": "top", "toSide": "top" },
+    { "id": "slots-ok", "from": "intent", "to": "order", "label": "槽位齐全", "variant": "emphasis", "role": "main" },
+    { "id": "order-ok", "from": "order", "to": "logistics", "variant": "default", "role": "main" },
+    { "id": "order-retry", "from": "order", "to": "ask", "label": "RETRY_ASK", "variant": "dashed", "role": "branch" },
+    { "id": "logi-policy", "from": "logistics", "to": "policy", "variant": "default", "role": "main" },
+    { "id": "policy-decision", "from": "policy", "to": "decision", "variant": "default", "role": "main" },
+    { "id": "auto-pass", "from": "decision", "to": "execute", "label": "自动通过", "variant": "emphasis", "role": "main" },
+    { "id": "escalate", "from": "decision", "to": "human", "label": "超上限", "variant": "security", "role": "error" },
+    { "id": "rejected", "from": "decision", "to": "notify", "label": "REJECTED", "variant": "dashed", "role": "branch" },
+    { "id": "exec-notify", "from": "execute", "to": "notify", "variant": "default", "role": "main" },
+    { "id": "human-notify", "from": "human", "to": "notify", "variant": "default", "role": "main", "route": "bottom-channel", "fromSide": "bottom", "toSide": "bottom" }
+  ],
+  "cards": [
+    {
+      "dot": "rose",
+      "title": "两条路径互不调用",
+      "items": [
+        "api/ 只装配 ReActAgent，未 import 状态机图",
+        "状态机图仅由 examples/aftersales_langgraph.py 自建驱动",
+        "图内 6 个工具与 registry 10 个是两套实例"
+      ]
+    },
+    {
+      "dot": "cyan",
+      "title": "节点真实度与三条短路出口",
+      "items": [
+        "②③④⑥⑦⑧ 走真实工具查库；① 三级容错 DeepSeek→OpenAI→关键词",
+        "⑥ RETURN_SHIPPING 手工拼面单未调工具；③ 物流结果无下游消费",
+        "intent=OTHER → OUT_OF_SCOPE 直送通知；护栏 BLOCK → 直送人工",
+        "decision=REJECTED → 跳过 execute_action 仅发拒绝答复"
+      ]
+    },
+    {
+      "dot": "emerald",
+      "title": "待开发的分支",
+      "items": [
+        "EXCHANGE 意图可被抽出，但下游无换货动作（CreateExchangeOrderTool 未进图）",
+        "ask_user 超 3 轮在节点内直接开工单并 END，未复用 human_escalation",
+        "意图未参与决策：condition_decision 只看政策与金额"
+      ]
+    }
+  ]
+}

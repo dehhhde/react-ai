@@ -4,8 +4,14 @@
 
     metrics.inc("intent_extraction_total", {"source": "llm"})
     metrics.observe("node_latency_seconds", elapsed, {"node": "intent_recognition"})
+    metrics.record_tool_call(tool_name="query_order", tenant_id="t1",
+                             success=False, error_type="business",
+                             error_code="order_not_found", duration_ms=12.3)
 
-snapshot() 供健康检查与脚本自证，to_prometheus_text() 供 /metrics 端点抓取。
+工具调用按 tool/tenant/error_type/error_code 维度记录，统一并入通用序列：
+计数器 react_ai_tool_calls_total 与直方图 react_ai_tool_call_duration_ms。
+snapshot() 供健康检查与脚本自证，to_prometheus_text()/to_prometheus() 供
+/metrics 端点抓取（含熔断状态 gauge）。
 """
 import threading
 from typing import Dict, List, Optional, Tuple
@@ -31,6 +37,8 @@ def _render_name(name: str, key: str) -> str:
 
 
 class MetricsCollector:
+    """指标收集器：通用带标签序列 + 工具调用 tool/tenant/error_type 维度统计."""
+
     def __init__(self):
         self._lock = threading.Lock()
         self.total_tokens: int = 0
@@ -47,11 +55,44 @@ class MetricsCollector:
             self.total_requests += 1
             self.total_tokens += tokens
 
-    def record_tool_call(self, tool_name: str, success: bool):
+    def record_tool_call(
+        self,
+        tool_name: str,
+        tenant_id: str = "default",
+        success: bool = True,
+        error_type: str = "none",
+        error_code: str = "none",
+        duration_ms: float = 0.0,
+    ) -> None:
+        """记录一次工具调用.
+
+        同时写入三处：
+        - 旧版兼容字段 tool_call_counts / tool_error_counts
+        - 计数器 react_ai_tool_calls_total{tool,tenant,error_type,error_code}
+        - 直方图 react_ai_tool_call_duration_ms{tool,tenant}
+
+        Args:
+            tool_name: 工具名
+            tenant_id: 租户ID
+            success: 是否成功
+            error_type: 错误大类（schema/business/auth/external），成功时为 "none"
+            error_code: 具体错误码（rate_limited/circuit_open/tool_timeout 等），成功时为 "none"
+            duration_ms: 耗时毫秒
+        """
         with self._lock:
             self.tool_call_counts[tool_name] = self.tool_call_counts.get(tool_name, 0) + 1
             if not success:
                 self.tool_error_counts[tool_name] = self.tool_error_counts.get(tool_name, 0) + 1
+        self.inc("react_ai_tool_calls_total", {
+            "tool": tool_name,
+            "tenant": tenant_id,
+            "error_type": error_type,
+            "error_code": error_code,
+        })
+        self.observe("react_ai_tool_call_duration_ms", duration_ms, {
+            "tool": tool_name,
+            "tenant": tenant_id,
+        })
 
     # ------------------------------------------------------------------ 计数器
     def inc(self, name: str, labels: Optional[Dict[str, str]] = None, value: float = 1.0):
@@ -121,7 +162,7 @@ class MetricsCollector:
         }
 
     def to_prometheus_text(self) -> str:
-        """Prometheus 文本格式：计数器原样，直方图按 summary 类型导出分位数。"""
+        """Prometheus 文本格式：计数器原样，直方图按 summary 类型导出分位数，末尾附熔断状态 gauge。"""
         snap = self.snapshot()
         lines: List[str] = [
             "# HELP react_ai_total_requests Total agent requests.",
@@ -144,7 +185,24 @@ class MetricsCollector:
                     lines.append(f"{name}{{{label}}} {value}")
                 lines.append(f"{_render_name(f'{name}_sum', key)} {series['sum']}")
                 lines.append(f"{_render_name(f'{name}_count', key)} {series['count']}")
+        # 熔断状态 gauge：0=closed 1=half-open 2=open
+        try:
+            from react_ai.tools.resilience import get_circuit_breaker_registry
+
+            state_map = {"closed": 0, "half-open": 1, "open": 2}
+            lines.append("# HELP react_ai_circuit_breaker_state Circuit breaker state per tool (0=closed, 1=half-open, 2=open)")
+            lines.append("# TYPE react_ai_circuit_breaker_state gauge")
+            for tool_name, cb in get_circuit_breaker_registry().all().items():
+                lines.append(
+                    f'react_ai_circuit_breaker_state{{tool="{tool_name}"}} {state_map.get(cb.state, 0)}'
+                )
+        except Exception:
+            pass
         return "\n".join(lines) + "\n"
+
+    def to_prometheus(self) -> str:
+        """to_prometheus_text 的别名（observability 路由沿用该入口名）。"""
+        return self.to_prometheus_text()
 
     def reset(self):
         """清空全部指标（单测与离线演示用，生产不调用）。"""
