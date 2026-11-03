@@ -66,7 +66,7 @@ from react_ai.tools.aftersales import (
     SearchPolicyTool,
     SendNotificationTool,
 )
-from react_ai.tools.base import BaseTool, ToolContext, ToolResult, tool
+from react_ai.tools.base import BaseTool, ToolContext, ToolResult, tool, ToolInputModel
 from react_ai.tools.registry import ToolRegistry
 
 __version__ = "0.1.0"
@@ -101,6 +101,7 @@ __all__ = [
     "InMemoryMessageBus",
     "InterceptShipmentTool",
     "KeywordGuardrail",
+    "ToolInputModel",
     "MessageBody",
     "MessageContext",
     "MessageEnvelope",

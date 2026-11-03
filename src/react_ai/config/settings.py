@@ -47,12 +47,29 @@ class SecurityConfig(BaseSettings):
     enable_guardrails: bool = Field(default=True, alias="ENABLE_GUARDRAILS")
     max_tool_execution_timeout: float = Field(default=30.0, alias="TOOL_TIMEOUT")
     sandbox_mode: str = Field(default="strict", alias="SANDBOX_MODE")
+    enable_hitl: bool = Field(default=True, alias="ENABLE_HITL")
+    approval_timeout_seconds: float = Field(default=3600.0, alias="APPROVAL_TIMEOUT_SECONDS")
+    enable_idempotency: bool = Field(default=True, alias="ENABLE_IDEMPOTENCY")
+    idempotency_ttl_seconds: float = Field(default=86400.0, alias="IDEMPOTENCY_TTL_SECONDS")
+    enable_result_cache: bool = Field(default=False, alias="ENABLE_RESULT_CACHE")
+    enable_circuit_breaker: bool = Field(default=True, alias="ENABLE_CIRCUIT_BREAKER")
+    enable_rate_limit: bool = Field(default=True, alias="ENABLE_RATE_LIMIT")
 
 
 class ObservabilityConfig(BaseSettings):
     enable_tracing: bool = Field(default=True, alias="ENABLE_TRACING")
     log_level: str = Field(default="INFO", alias="LOG_LEVEL")
     otlp_endpoint: str | None = Field(default=None, alias="OTEL_EXPORTER_OTLP_ENDPOINT")
+    # 审计存储后端：memory | postgres | elasticsearch
+    audit_backend: str = Field(default="postgres", alias="AUDIT_BACKEND")
+    # Elasticsearch 依赖服务留空占位，后续补充（如 http://127.0.0.1:9200）
+    es_hosts: str | None = Field(default=None, alias="ES_HOSTS")
+    es_index: str = Field(default="tool_call_audit", alias="ES_INDEX")
+    es_api_key: str | None = Field(default=None, alias="ES_API_KEY")
+
+    model_config = SettingsConfigDict(
+        env_file=".env", env_file_encoding="utf-8", extra="ignore"
+    )
 
 
 class DatabaseConfig(BaseSettings):

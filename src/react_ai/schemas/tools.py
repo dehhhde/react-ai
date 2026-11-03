@@ -1,5 +1,5 @@
 """工具元数据与定义规范."""
-from typing import Any, Dict, Optional
+from typing import Any, Dict
 from pydantic import BaseModel, Field
 
 
@@ -16,10 +16,3 @@ class ToolDefinition(BaseModel):
     requires_approval: bool = False
     timeout_seconds: float = 30.0
     metadata: Dict[str, Any] = Field(default_factory=dict)
-
-
-class ToolExecutionResult(BaseModel):
-    success: bool
-    output: Any
-    error: Optional[str] = None
-    duration_ms: float = 0.0

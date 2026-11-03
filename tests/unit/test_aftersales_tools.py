@@ -188,13 +188,20 @@ class TestAfterSalesTools(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(res_ok.data["status"], "NEED_RETURN_SHIPPING")
 
         # 3. 奢侈品订单发起退款 (max_auto_refund_amount = 0，必须进入 PENDING_REVIEW)
+        #    使用独立幂等键：同键已成功执行会被重放缓存结果而非重新执行
         args_lux = {
             "order_id": "ORD_LUXURY_005",
             "item_id": "ITEM_LUXURY_005",
             "refund_amount": 8800.0,
             "reason": "高价值物品退款申请",
         }
-        res_lux = tool.call(args_lux, self.write_ctx)
+        lux_ctx = ToolContext(
+            caller_id="agent_service",
+            tenant_id="tenant_001",
+            user_id="USR_001",
+            idempotency_key="idemp_test_key_lux",
+        )
+        res_lux = tool.call(args_lux, lux_ctx)
         self.assertTrue(res_lux.ok)
         self.assertFalse(res_lux.data["auto_approved"])
         self.assertEqual(res_lux.data["status"], "PENDING_REVIEW")

@@ -1,6 +1,6 @@
 """企业级多模型智能路由与容灾降级网关."""
 from typing import AsyncGenerator, Dict, List, Optional
-from react_ai.llm.base import BaseLLMClient, LLMResponse
+from react_ai.llm.base import BaseLLMClient, LLMResponse, LLMStreamChunk
 from react_ai.schemas.messages import ChatMessage
 from react_ai.schemas.tools import ToolDefinition
 
@@ -40,6 +40,25 @@ class LLMRouter(BaseLLMClient):
         for client in clients:
             try:
                 async for chunk in client.stream_generate(messages, tools, temperature):
+                    yield chunk
+                return
+            except Exception:
+                continue
+        raise RuntimeError("全部 LLM 流式节点请求失败")
+
+    async def stream_generate_full(
+        self,
+        messages: List[ChatMessage],
+        tools: Optional[List[ToolDefinition]] = None,
+        temperature: float = 0.2,
+        max_tokens: Optional[int] = None,
+        tool_choice: Optional[str] = None,
+    ) -> AsyncGenerator[LLMStreamChunk, None]:
+        """流式（含工具调用增量）容灾：按主备顺序尝试各节点."""
+        clients = [self.primary] + self.fallbacks
+        for client in clients:
+            try:
+                async for chunk in client.stream_generate_full(messages, tools, temperature, max_tokens, tool_choice):
                     yield chunk
                 return
             except Exception:

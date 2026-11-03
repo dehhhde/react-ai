@@ -1,6 +1,14 @@
 """知识库检索 (RAG) 工具."""
-from typing import Any, Dict, List
-from react_ai.tools.base import BaseTool, ToolContext
+from typing import Any
+
+from pydantic import Field
+
+from react_ai.tools.base import BaseTool, ToolContext, ToolInputModel
+
+
+class KnowledgeSearchInput(ToolInputModel):
+    query: str = Field(description="检索关键词或问题")
+    top_k: int = Field(default=3, ge=1, le=10, description="返回文档切片数量")
 
 
 class KnowledgeRetrievalTool(BaseTool):
@@ -8,17 +16,7 @@ class KnowledgeRetrievalTool(BaseTool):
     description = "在企业向量知识库中语义搜索相关文档切片"
     side_effects = "read"
     tags = ["rag", "retrieval"]
-
-    @property
-    def input_schema(self) -> dict:
-        return {
-            "type": "object",
-            "properties": {
-                "query": {"type": "string", "description": "检索关键词或问题"},
-                "top_k": {"type": "integer", "description": "返回文档切片数量", "minimum": 1, "maximum": 10},
-            },
-            "required": ["query"],
-        }
+    input_model = KnowledgeSearchInput
 
     def execute(self, arguments: dict, ctx: ToolContext) -> Any:
         query = arguments.get("query", "")
