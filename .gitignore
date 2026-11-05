@@ -12,3 +12,6 @@ venv/
 .ruff_cache/
 .idea/
 .vscode/
+
+# 意图评测的临时报告（基线 eval/baselines/ 需入库，单次运行报告不入库）
+eval/reports/

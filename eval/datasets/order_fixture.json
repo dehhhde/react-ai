@@ -1,0 +1,11 @@
+{
+  "_comment": "意图评测用的订单归属固定桩数据，与 scripts/init_aftersales_db.py 的种子数据保持一致；--db stub 模式下由它替代真实 PG 校验，保证无 PG 环境（CI）得分可复现。",
+  "orders": {
+    "ORD_CLOTH_001": "USR_001",
+    "ORD_CLOTH_002": "USR_001",
+    "ORD_FRESH_003": "USR_002",
+    "ORD_EXPIRED_004": "USR_003",
+    "ORD_LUXURY_005": "USR_003",
+    "ORD_TRANSIT_006": "USR_001"
+  }
+}
