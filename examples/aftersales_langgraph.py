@@ -40,7 +40,7 @@ import re                                                # 导入正则模块，
 import uuid                                             # 导入通用唯一标识符模块，用于生成幂等键、运单号等随机ID
 from contextlib import asynccontextmanager              # 导入异步上下文管理器装饰器，用于封装 PG 检查点的连接生命周期
 from pathlib import Path                                # 导入路径对象类，用于跨平台地解析文件/目录路径
-from typing import Dict, Any, Optional, Literal, List   # 导入类型注解工具：字典、任意类型、可选类型、字面量枚举类型、列表
+from typing import Dict, Any, Optional, Literal, List, ClassVar   # 导入类型注解工具：字典、任意类型、可选类型、字面量枚举类型、列表、类级常量
 from typing_extensions import TypedDict                 # 导入 TypedDict，用类型字典形式定义 LangGraph 的状态结构
 from pydantic import BaseModel, Field, ValidationError, field_validator  # 导入 Pydantic 校验基类、字段约束、校验异常与自定义校验器
 
@@ -63,6 +63,10 @@ from react_ai.schemas.tools import ToolDefinition, ToolParameterSchema  # 导入
 from react_ai.guardrails.base import GuardrailChain, GuardrailAction, GuardrailContext, GuardrailDirection  # 护栏链、动作枚举、检查上下文与方向枚举
 from react_ai.guardrails.injection import PromptInjectionGuardrail  # 提示词注入/越狱特征检测护栏
 from react_ai.guardrails.pii import PIIMaskingGuardrail             # 手机号/身份证正则脱敏护栏
+
+# 导入 Prompt 引擎：示例提示词迁移为 BasePrompt 实体，统一获得渲染缓存与审计观测（§2.1）
+from react_ai.prompts.base import BasePrompt                        # 提示词基类：模板/Schema/输出约束/审计统一契约
+from react_ai.prompts.manager import prompt_manager                 # 全局提示词管理器：注册与按名渲染
 
 # 导入本项目已定义好的电商售后工具与上下文
 from react_ai.tools.base import ToolContext             # 导入工具执行上下文（携带调用方、租户、用户、幂等键等信息）
@@ -87,14 +91,15 @@ escalate_to_human_tool = EscalateToHumanTool()         # 创建转人工工具�
 # ============================================================================
 # 0. LLM 意图识别基础设施 (真实大模型 + 槽位 Schema)
 # ============================================================================
-SLOT_EXTRACTION_PROMPT = """你是电商售后系统的意图与槽位抽取器。只输出一个 JSON 对象，禁止输出任何其他文字。
+# 槽位抽取系统提示词原文：由下方 SlotExtractionPrompt 实体承载，经 PromptManager 统一渲染
+_SLOT_EXTRACTION_SYSTEM_TEXT = """你是电商售后系统的意图与槽位抽取器。只输出一个 JSON 对象，禁止输出任何其他文字。
 字段定义:
 - intent: 意图枚举，取值 RETURN_AND_REFUND(退货退款) / REFUND_ONLY(仅退款) / EXCHANGE(换货) / OTHER(非售后诉求：查天气、问客服电话、闲聊等越界内容一律归此类)
 - order_id: 用户明确提供的订单号原文；用户未提及时必须为 null，严禁编造
 - reason: 售后原因简述（不超过20字）；未提及为 null
 - reason_type: 原因大类，取值 quality_issue(商品破损/质量瑕疵等质量问题) / no_reason(不喜欢等无理由诉求)
 - missing_slots: intent / order_id / reason_type 中无法从对话判断的字段名列表，均能判断时为空数组
-示例: {"intent": "RETURN_AND_REFUND", "order_id": "ORD123", "reason": "衣服破损", "reason_type": "quality_issue", "missing_slots": []}"""  # 槽位抽取的系统提示词：定义输出 JSON Schema 与"禁止编造订单号"约束
+示例: {"intent": "RETURN_AND_REFUND", "order_id": "ORD123", "reason": "衣服破损", "reason_type": "quality_issue", "missing_slots": []}"""
 
 REQUIRED_SLOTS = ("intent", "order_id", "reason_type")  # 必要槽位：意图、订单号、原因大类缺失时必须追问用户补槽
 
@@ -115,6 +120,39 @@ class SlotExtractionResult(BaseModel):                 # Pydantic 槽位抽取�
         if isinstance(v, str):                         # 非空白字符串
             return v.strip()                           # 顺带去除首尾空白
         return v                                       # None 等原样透传
+
+
+class SlotExtractionPrompt(BasePrompt):                # 槽位抽取提示词实体：迁移到 Prompt 引擎（§2.1/2.3）
+    """纯 system 提示词：模板文本不变，output_schema 与 SlotExtractionResult 同构，
+    渲染时由 BasePrompt 自动追加 JSON Schema 强约束段，并获得渲染缓存与审计观测。"""
+
+    name: str = "aftersales_slot_extraction"           # Prompt 唯一标识，注册进 PromptManager
+    version: str = "1.0.0"                             # 版本号，支持灰度与回滚
+    description: str = "电商售后意图与槽位抽取（结构化 JSON 输出）"
+    tags: ClassVar[list[str]] = ["aftersales", "slot_filling", "json"]
+    output_format: str = "json"                        # 触发 output_schema 约束段追加
+    output_schema: ClassVar[dict] = {                  # SlotExtractionResult 的 JSON Schema 镜像
+        "type": "object",
+        "properties": {
+            "intent": {"type": "string", "enum": ["RETURN_AND_REFUND", "REFUND_ONLY", "EXCHANGE", "OTHER"]},
+            "order_id": {"type": "string", "pattern": "^[A-Za-z0-9_\\-]{4,64}$"},
+            "reason": {"type": "string", "maxLength": 50},
+            "reason_type": {"type": "string", "enum": ["quality_issue", "no_reason"]},
+            "missing_slots": {"type": "array", "items": {"type": "string"}},
+        },
+        "required": ["intent"],
+    }
+
+    @property
+    def system_template(self) -> str:                  # 系统提示模板：原文不变（单花括号 JSON 示例对 Jinja 安全）
+        return _SLOT_EXTRACTION_SYSTEM_TEXT
+
+    @property
+    def user_template(self) -> str:                    # 纯 system 提示词：不追加 user 消息，历史由调用方拼接
+        return ""
+
+
+prompt_manager.register_prompt(SlotExtractionPrompt())  # 模块级注册：示例与引擎共用同一全局管理器
 
 _llm_router: Optional[LLMRouter] = None                # LLM 路由器全局懒加载单例（首次使用时初始化）
 
@@ -240,8 +278,9 @@ async def extract_slots_via_llm(messages: list) -> Optional[Dict[str, Any]]:  # 
     槽位取自协议层保证的 tool_calls.arguments；模型未走工具路径时回退解析正文 JSON。"""
     try:                                                 # 包住整个 LLM 调用，网络/解析异常统一走降级
         router = get_llm_router()                        # 获取（或懒初始化）LLM 路由器
-        request_messages = [ChatMessage(role="system", content=SLOT_EXTRACTION_PROMPT)] + [  # 系统提示词 + 多轮对话历史
-            ChatMessage(role=m["role"], content=m["content"]) for m in messages               # 将历史 dict 转为 ChatMessage 模型
+        prompt_result = prompt_manager.render_prompt("aftersales_slot_extraction", {})  # 经 Prompt 引擎渲染 system（含 Schema 约束段与审计）
+        request_messages = prompt_result.to_chat_messages() + [                         # 系统提示词 + 多轮对话历史
+            ChatMessage(role=m["role"], content=m["content"]) for m in messages         # 将历史 dict 转为 ChatMessage 模型
         ]
         response = await router.generate(                # 低温度调用并强制工具：协议层保证结构化输出
             request_messages,

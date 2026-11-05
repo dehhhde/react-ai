@@ -29,6 +29,18 @@ class MemoryConfig(BaseSettings):
     db: int = Field(default=0, alias="REDIS_DB")
     redis_url: str | None = Field(default=None, alias="REDIS_URL")
     session_ttl_seconds: int = Field(default=86400, alias="SESSION_TTL")
+    tool_result_ttl_seconds: int = Field(
+        default=3600, alias="TOOL_RESULT_TTL"
+    )  # 工具结果记忆 TTL（秒）
+    working_ttl_seconds: int = Field(
+        default=1800, alias="WORKING_TTL"
+    )  # 工作记忆快照 TTL（秒）
+    history_token_budget: int = Field(
+        default=4000, alias="HISTORY_TOKEN_BUDGET"
+    )  # 会话历史注入 LLM 前的 token 预算，<=0 表示不启用（差距分析 2.5）
+    enforce_tenant_isolation: bool = Field(
+        default=True, alias="ENFORCE_TENANT_ISOLATION"
+    )  # 租户强制隔离闸（差距分析 2.6）：True 时禁止 tenant_id=None 的跨租户读写
 
     model_config = SettingsConfigDict(
         env_file=".env", env_file_encoding="utf-8", extra="ignore"

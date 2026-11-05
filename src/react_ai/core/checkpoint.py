@@ -15,6 +15,7 @@ class RunCheckpoint(BaseModel):
     run_id: str
     session_id: str
     user_id: Optional[str] = None
+    tenant_id: Optional[str] = None
     metadata: Dict[str, Any] = Field(default_factory=dict)
     current_step: int = 0
     messages: List[ChatMessage] = Field(default_factory=list)

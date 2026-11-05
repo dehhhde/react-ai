@@ -9,7 +9,7 @@
 from __future__ import annotations
 
 import time
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, contextmanager
 from typing import Any, Dict, List, Optional
 
 from react_ai.config.settings import settings
@@ -146,6 +146,30 @@ class AgentTracer:
                     pass
             self._spans.append(record)
             # 防止内存无限增长，最多保留最近 10000 条
+            if len(self._spans) > 10000:
+                self._spans = self._spans[-10000:]
+
+    @contextmanager
+    def span(self, name: str, attributes: Optional[Dict[str, Any]] = None):
+        """同步版 span 上下文管理器（供 prompt.render 等同步代码段接入链路追踪）."""
+        record = SpanRecord(name=name, attributes=attributes)
+
+        class _SyncSpanProxy:
+            def __init__(self, rec: SpanRecord):
+                self._rec = rec
+
+            def set_attribute(self, key: str, value: Any) -> None:
+                self._rec.attributes[key] = value
+
+        proxy = _SyncSpanProxy(record)
+        try:
+            yield proxy
+            record.end(status="ok")
+        except Exception as exc:
+            record.end(status="error", error_message=str(exc))
+            raise
+        finally:
+            self._spans.append(record)
             if len(self._spans) > 10000:
                 self._spans = self._spans[-10000:]
 

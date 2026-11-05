@@ -42,6 +42,9 @@ class RedisMemory(BaseMemory):
         max_items: int = 10000,
         socket_timeout: float = 5.0,
         lazy_connect: bool = True,
+        session_ttl_seconds: float | None = None,
+        history_token_budget: int | None = None,
+        enforce_tenant_isolation: bool = True,
     ):
         """初始化 Redis 记忆存储实例。
 
@@ -59,7 +62,13 @@ class RedisMemory(BaseMemory):
             socket_timeout: 网络操作超时时长（秒）。
             lazy_connect: 是否惰性连接（True 表示在首次数据操作或 ping 时才建立连接）。
         """
-        super().__init__(name=name, max_items=max_items)
+        super().__init__(
+            name=name,
+            max_items=max_items,
+            session_ttl_seconds=session_ttl_seconds,
+            history_token_budget=history_token_budget,
+            enforce_tenant_isolation=enforce_tenant_isolation,
+        )
         self.key_prefix = key_prefix
         self.socket_timeout = socket_timeout
         # 若未提供显式连接参数且无外部 client，则自动从全局 settings 继承配置

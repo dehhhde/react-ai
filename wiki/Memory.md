@@ -55,15 +55,46 @@ class WindowBufferMemory:
 
 ## 长期语义记忆 LongTermSemanticMemory
 
-文件：[memory/long_term.py](file:///d:/code/react-ai/src/react_ai/memory/long_term.py)
+文件：[memory/long_term.py](file:///d:/code/react-ai/src/react_ai/memory/long_term.py)，依赖向量检索基建子包 [memory/vector/](file:///d:/code/react-ai/src/react_ai/memory/vector/)。
 
 ```python
 class LongTermSemanticMemory:
-    def __init__(self, vector_index_name: str = "agent_memories"): ...
-    async def search_relevant_facts(self, user_id: str, query: str, top_k: int = 5) -> list[str]
+    def __init__(self, *, embedding=None, store=None,
+                 vector_index_name: str = "agent_memories", tenant_id=None): ...
+    async def add_fact(self, user_id, fact, *, tenant_id=None, metadata=None) -> str
+    async def search_relevant_facts(self, user_id, query, top_k=5,
+                                     *, tenant_id=None, min_score=None) -> list[str]
+    async def search_relevant(self, user_id, query, top_k=5, *, tenant_id=None) -> list[SearchHit]
+    async def forget_user(self, user_id, *, tenant_id=None) -> int
 ```
 
-按用户输入跨会话召回相关事实/偏好画像。当前为接口占位实现，生产需对接向量数据库索引。
+写入侧将事实 embedding 后 upsert 进向量库（按 user/tenant 打身份标签），召回侧走 ANN top-k，`vector_index_name` 真实生效（PgVectorStore 中即表名）。user_id 必填，跨用户/跨租户记录不可召回。
+
+### 向量基建 memory/vector/
+
+| 抽象/实现 | 文件 | 说明 |
+|---|---|---|
+| `BaseEmbeddingProvider` / `BaseVectorStore` / `VectorRecord` / `SearchHit` | [vector/base.py](file:///d:/code/react-ai/src/react_ai/memory/vector/base.py) | 向量化与向量存储统一接口，检索内置身份过滤 |
+| `OpenAIEmbeddingProvider` | [vector/embedding.py](file:///d:/code/react-ai/src/react_ai/memory/vector/embedding.py) | OpenAI 兼容 `/embeddings`；零 Key 自动降级哈希伪向量并告警 |
+| `HashingEmbeddingProvider` | 同上 | 确定性特征哈希伪向量，离线开发/演示用 |
+| `PgVectorStore` | [vector/pgvector.py](file:///d:/code/react-ai/src/react_ai/memory/vector/pgvector.py) | pgvector 生产实现：索引名即表名、自动建扩展建表、余弦距离 `<=>` 检索、SQL 层身份过滤、`asyncio.to_thread` 卸载同步 psycopg |
+| `InMemoryVectorStore` | [vector/in_memory.py](file:///d:/code/react-ai/src/react_ai/memory/vector/in_memory.py) | 进程内存余弦暴力检索，开发/测试与单机降级 |
+
+```python
+from react_ai.memory import LongTermSemanticMemory
+from react_ai.memory.vector import OpenAIEmbeddingProvider, PgVectorStore
+
+ltm = LongTermSemanticMemory(
+    embedding=OpenAIEmbeddingProvider(),          # 真实 embedding 服务
+    store=PgVectorStore(),                        # 复用 settings.database.url 的 pgvector
+    vector_index_name="user_facts",
+    tenant_id="acme",
+)
+await ltm.add_fact("u-1", "偏好使用 Python 异步风格代码")
+facts = await ltm.search_relevant_facts("u-1", "用户的代码风格偏好")
+```
+
+缺省装配（不传 embedding/store）为 Hashing + InMemory，零外部依赖可用；生产必须注入真实实现。状态：已实现，⏳ 待验收测试（见 [Memory-Gap-Analysis](Memory-Gap-Analysis.md) 2.3）。
 
 ## 存储驱动 stores/
 

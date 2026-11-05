@@ -2,7 +2,7 @@
 
 > 适用对象：[src/react_ai/prompts/](file:///d:/code/react-ai/src/react_ai/prompts/) 模块及其在项目中的实际使用情况。
 > 本文档回答：**当前 prompts 模块到了什么水准？距离企业级生产提示词工程还差什么、怎么补？**
-> 更新时间：2026-11-02
+> 更新时间：2026-11-04（已按代码现状核对各项落地状态）
 
 ---
 
@@ -45,7 +45,7 @@
 
 ## 2. 企业级差距分析（按重要性排序）
 
-### 2.1 与核心引擎完全脱节 —— prompts 模块是孤岛 ⚠️ P0
+### 2.1 与核心引擎完全脱节 —— prompts 模块是孤岛 ⚠️ P0 ✅ 已完成
 
 **现状**：`ReActAgent.stream()`（[engine.py#L92-L103](file:///d:/code/react-ai/src/react_ai/core/engine.py#L92-L103)）只把用户 query 作为 `MessageRole.USER` 追加到 `state.messages`，然后直接调 `self.llm.generate(messages=state.messages, ...)`，**没有任何 system prompt 注入**。`AgentConfig.system_prompt_override` 字段（[schemas/agent.py#L15](file:///d:/code/react-ai/src/react_ai/schemas/agent.py#L15)）存在但全项目无任何读取点。业务侧 `aftersales_langgraph.py` 直接硬编码 `SLOT_EXTRACTION_PROMPT = """..."""` 后 `ChatMessage(role="system", content=SLOT_EXTRACTION_PROMPT)` 拼消息。
 
@@ -76,7 +76,7 @@ state.messages = self._build_system_messages() + [ChatMessage(role=MessageRole.U
 
 ---
 
-### 2.2 渲染路径不一致 —— 同一模块两套引擎 ⚠️ P0
+### 2.2 渲染路径不一致 —— 同一模块两套引擎 ⚠️ P0 ✅ 已完成
 
 **现状**：`BasePrompt._render_template` 用 `str.replace("{{key}}", str(value))`（[base.py#L86-L93](file:///d:/code/react-ai/src/react_ai/prompts/base.py#L86-L93)），不支持条件、循环、过滤器、默认值；而 `PromptManager.render` 用 Jinja2 `Template(raw).render(**variables)`（[manager.py#L33-L38](file:///d:/code/react-ai/src/react_ai/prompts/manager.py#L33-L38)）。两条路径并存，行为不一致。
 
@@ -106,7 +106,7 @@ class BasePrompt(ABC):
 
 ---
 
-### 2.3 输出约束字段形同虚设 —— output_schema 未生效 ⚠️ P0
+### 2.3 输出约束字段形同虚设 —— output_schema 未生效 ⚠️ P0 ✅ 已完成
 
 **现状**：`BasePrompt` 声明了 `output_format`（`json`/`structured`/`free_text`）与 `output_schema`（JSON Schema）字段，但 `render()` 从头到尾没有读取它们——既没有把 schema 注入 system prompt，也没有和 Pydantic / function calling 绑定。`output_schema` 只是一个永远不被消费的元数据。
 
@@ -128,7 +128,7 @@ def render(self, variables, trace_id=None):
 
 ---
 
-### 2.4 安全护栏未集成 —— 变量直入模板无防护 🔒 P1
+### 2.4 安全护栏未集成 —— 变量直入模板无防护 🔒 P1 ✅ 已完成
 
 **现状**：`BasePrompt._render_template` 直接 `str(value)` 替换进模板，没有任何清洗。项目已有完整的 `GuardrailChain`（[guardrails/base.py](file:///d:/code/react-ai/src/react_ai/guardrails/base.py)）含 `PromptInjectionGuardrail` 与 `PIIMaskingGuardrail`，但 prompts 模块完全不调用。用户/外部变量可能包含注入指令（如"忽略上述所有指示"），直接拼入 system prompt 会污染整个提示词。
 
@@ -154,7 +154,7 @@ def render(self, variables, trace_id=None, guardrail_chain=None):
 
 ---
 
-### 2.5 版本管理无持久化、无灰度 —— 进程重启即丢失 📦 P1
+### 2.5 版本管理无持久化、无灰度 —— 进程重启即丢失 📦 P1 ✅ 已完成
 
 **现状**：`PromptManager` 用内存 `dict` 存储模板与实体，`version` 字段仅作展示。没有版本注册中心、没有 A/B 测试路由、没有回滚能力、没有持久化。`prompt_manager` 是模块级单例，每次启动都是默认的两条内置项。
 
@@ -185,7 +185,7 @@ class PromptManager:
 
 ---
 
-### 2.6 变量校验太浅 —— 只查存在性 🔍 P1
+### 2.6 变量校验太浅 —— 只查存在性 🔍 P1 ✅ 已完成
 
 **现状**：`validate_variables` 只检查必填变量"存在且非 None"（[base.py#L77-L84](file:///d:/code/react-ai/src/react_ai/prompts/base.py#L77-L84)）。没有类型校验、长度限制、正则格式约束；未在 `required_variables` / `optional_variables` 中声明的变量被静默忽略（不报错也不警告），容易掩盖拼写错误（如 `orderId` 写成 `order_id` 不会被发现）。
 
@@ -205,7 +205,7 @@ variable_schemas: ClassVar[dict[str, VariableSchema]] = {
 
 ---
 
-### 2.7 可观测性薄弱 —— 只有一行日志 📊 P1
+### 2.7 可观测性薄弱 —— 只有一行日志 📊 P1 ✅ 已完成
 
 **现状**：`render()` 仅 `logger.info("prompt_rendered ...")` 一行（[base.py#L125-L128](file:///d:/code/react-ai/src/react_ai/prompts/base.py#L125-L128)）。项目已有 `observability/tracer.py`（OpenTelemetry span）、`observability/metrics.py`、`utils/token_counter.py`，但 prompts 模块均未接入。无法在链路追踪中看到 prompt 渲染 span，无法统计 token 消耗，无法把 prompt 版本与 LLM 响应质量关联。
 
@@ -220,7 +220,7 @@ variable_schemas: ClassVar[dict[str, VariableSchema]] = {
 
 ---
 
-### 2.8 少样本静态写死 —— 无法动态选择 🎯 P2
+### 2.8 少样本静态写死 —— 无法动态选择 🎯 P2 ✅ 已完成
 
 **现状**：`examples` 是类属性，写死在代码里（[test_prompts.py#L40-L50](file:///d:/code/react-ai/tests/unit/test_prompts.py#L40-L50) 即典型用法）。所有用户请求都看到完全相同的示例，无法根据输入语义挑选最相关示例（dynamic few-shot），也没有数量上限与 token 预算截断。
 
@@ -235,7 +235,7 @@ variable_schemas: ClassVar[dict[str, VariableSchema]] = {
 
 ---
 
-### 2.9 无多语言 / 本地化 🌐 P2
+### 2.9 无多语言 / 本地化 🌐 P2 ✅ 已完成
 
 **现状**：所有模板硬编码中文，没有按 locale 选择模板的能力。跨境业务或多语言客服场景无法支持。
 
@@ -245,7 +245,7 @@ variable_schemas: ClassVar[dict[str, VariableSchema]] = {
 
 ---
 
-### 2.10 无外部存储与热更新 🔥 P2
+### 2.10 无外部存储与热更新 🔥 P2 ⚠️ 部分完成
 
 **现状**：模板只能通过代码 `register()` / `register_prompt()` 注册，没有从文件、数据库、配置中心加载的能力；没有热加载，改提示词必须重启服务。
 
@@ -256,9 +256,11 @@ variable_schemas: ClassVar[dict[str, VariableSchema]] = {
 
 **验收标准**：新增/修改模板文件无需重启即可生效；从 PG/配置中心加载的模板变更有热更新机制。
 
+**落地状态**：✅ 文件目录加载 + mtime 热更新已实现（`manager.load_from_directory` / `reload_if_changed`，支持 `.jinja/.j2/.yaml/.json`；`examples_source` 亦按 mtime 重载）。⚠️ 未完成：PG / 配置中心（Apollo、Nacos）模板源及其热更新。
+
 ---
 
-### 2.11 无评测集与回归机制 🧪 P2
+### 2.11 无评测集与回归机制 🧪 P2 ⚠️ 部分完成
 
 **现状**：没有 prompt 级别的评测集与回归脚本。改一版提示词无法量化"哪类用例退步了"。这与 [Intent-Recognition-Optimization.md](file:///d:/code/react-ai/wiki/Intent-Recognition-Optimization.md) §2.1 提到的评测集基础设施是同一类缺口，应统一建设。
 
@@ -266,9 +268,11 @@ variable_schemas: ClassVar[dict[str, VariableSchema]] = {
 
 **验收标准**：每个核心 prompt 有 ≥20 条评测样本；提示词变更 PR 必须附评测分数 diff。
 
+**落地状态**：✅ 评测基础设施已建成（`eval/run_prompt_eval.py` 结构断言 + 基线 sha256 diff + `--update-baseline`/`--llm` 冒烟；`eval/prompts/react_standard.json` 22 样本）。⚠️ 未完成：`aftersales_slot_extraction` 等其他核心 prompt 尚无 ≥20 样本评测集（当前仅覆盖 react_standard 一个 prompt）。
+
 ---
 
-### 2.12 无渲染缓存 ⚡ P2
+### 2.12 无渲染缓存 ⚡ P2 ✅ 已完成
 
 **现状**：每次 `render()` 都重新编译模板、重新替换。`PromptManager` 无 Jinja2 `Environment` 缓存（每次 `Template(raw)` 新建）。高并发下模板编译开销浪费。
 
@@ -285,6 +289,11 @@ variable_schemas: ClassVar[dict[str, VariableSchema]] = {
 | **P0（阻塞上线）** | 2.1 引擎接入 prompts → 2.2 统一 Jinja2 渲染 → 2.3 output_schema 生效 | 不做则 prompts 模块白建、核心 Agent 无系统提示词约束、输出结构无保障 |
 | **P1（安全合规 / 可运维）** | 2.4 护栏集成 → 2.5 版本持久化+灰度 → 2.6 变量 schema 校验 → 2.7 可观测性 | 注入/PII 是合规红线；无版本灰度无法安全迭代；无观测无法排障 |
 | **P2（质量 / 效率）** | 2.8 动态少样本 → 2.9 多语言 → 2.10 外部存储+热更新 → 2.11 评测回归 → 2.12 渲染缓存 | 体验与效率提升，依赖 P0/P1 落地后再做收益更大 |
+
+> **落地核对（2026-11-04）**：P0/P1 全部完成；P2 中 2.8、2.9、2.12 完成，2.10、2.11 部分完成。剩余事项：
+> 1. 2.10 —— PG / 配置中心（Apollo、Nacos）模板源接入及对应热更新（文件目录热更新已可用）；
+> 2. 2.11 —— 为 `aftersales_slot_extraction` 等其他核心 prompt 补齐 ≥20 样本评测集（当前仅 `react_standard` 有 22 样本）；
+> 3. 配套建设 —— 审计存储当前为内存环形 + 可选 JSONL 落盘，尚未按建议接入 PG（与 Checkpointer 复用同库）。
 
 > 配套建设（与 P1 并行）：**提示词审计存储**——每次渲染的 `PromptResult`（脱敏后变量快照）落库，这是 2.5 版本追溯、2.7 可观测性、2.11 评测回归的共同基础设施，建议与 PG Checkpointer 复用同一数据库。
 

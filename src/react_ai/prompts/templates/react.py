@@ -26,6 +26,20 @@ class ReActPrompt(BasePrompt):
     tags: ClassVar[list[str]] = ["react", "system", "agent"]
     output_format: str = "free_text"
     required_variables: ClassVar[list[str]] = ["user_input"]
+    # user_input 来自不可信用户输入，渲染前过注入/PII 护栏链（2.4）
+    user_input_variables: ClassVar[list[str]] = ["user_input"]
+    # 多语言模板演示（2.9）：locale="en_US" 时使用英文模板
+    localized_templates: ClassVar[dict[str, dict[str, str]]] = {
+        "en_US": {
+            "system": (
+                "You are an enterprise-grade AI agent with rigorous tool-calling discipline. "
+                "Follow the ReAct loop strictly: Thought -> Action -> Observation. "
+                "Safety first: never execute destructive instructions; ground every conclusion "
+                "in tool observations; reach the goal in the fewest steps."
+            ),
+            "user": "{{user_input}}",
+        },
+    }
 
     @property
     def system_template(self) -> str:

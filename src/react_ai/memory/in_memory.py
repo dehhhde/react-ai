@@ -28,6 +28,9 @@ class InMemoryMemory(BaseMemory):
         name: str = "in_memory",
         max_items: int = 10000,
         eviction_policy: str = "lru",
+        session_ttl_seconds: float | None = None,
+        history_token_budget: int | None = None,
+        enforce_tenant_isolation: bool = True,
     ):
         """初始化内存记忆存储。
 
@@ -35,8 +38,17 @@ class InMemoryMemory(BaseMemory):
             name: 记忆实例标识名称。
             max_items: 最大允许的条目数，超过触发淘汰清理。
             eviction_policy: 超出容量时的淘汰策略 ("lru", "lfu", "fifo")。
+            session_ttl_seconds: 会话记忆条目 TTL（秒），None 表示永不过期。
+            history_token_budget: 会话历史 token 预算，None/<=0 表示不裁剪。
+            enforce_tenant_isolation: 租户强制隔离闸（差距分析 2.6），默认 True。
         """
-        super().__init__(name=name, max_items=max_items)
+        super().__init__(
+            name=name,
+            max_items=max_items,
+            session_ttl_seconds=session_ttl_seconds,
+            history_token_budget=history_token_budget,
+            enforce_tenant_isolation=enforce_tenant_isolation,
+        )
         self.eviction_policy = eviction_policy.lower()
         self._storage: dict[str, MemoryItem] = {}
 

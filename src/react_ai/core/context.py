@@ -8,6 +8,7 @@ class RunContext(BaseModel):
     session_id: str = Field(default_factory=lambda: str(uuid.uuid4()), description="会话ID")
     run_id: str = Field(default_factory=lambda: str(uuid.uuid4()), description="单次运行TraceID")
     user_id: Optional[str] = Field(default=None, description="操作用户ID")
+    tenant_id: Optional[str] = Field(default=None, description="租户ID，与会话记忆身份三元组绑定")
     metadata: Dict[str, Any] = Field(default_factory=dict, description="跨环节附加元数据")
     budget_tokens: int = Field(default=100_000, description="本轮运行最大Token预算")
     used_tokens: int = Field(default=0, description="已消耗Token数")
