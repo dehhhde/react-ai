@@ -30,6 +30,8 @@
 | [LLM Gateway](LLM-Gateway.md) | `react_ai.llm` | BaseLLMClient 抽象、多厂商 Provider、工厂函数、LLMRouter 容灾降级 |
 | [Tools](Tools.md) | `react_ai.tools` | `@tool` 装饰器、ToolRegistry、ToolSandbox 沙箱、内置工具、售后业务工具集 |
 | [Memory](Memory.md) | `react_ai.memory` | BaseMemory/MemoryItem 模型、滑动窗口短期记忆、长期语义记忆、Redis/Postgres 存储 |
+| [RAG Design](RAG-Design.md) | `rag` / `react_ai.memory.vector` | 企业级 RAG 知识检索设计：知识空间与 ACL、索引管线、混合召回、引用生成、评测与灰度（设计文档） |
+| [Context Management Design](Context-Management-Design.md) | `react_ai.core` / `react_ai.memory` | 企业级上下文管理设计：分层模型、预算体系、组装协议、隔离与可观测 |
 | [Orchestration](Orchestration.md) | `react_ai.orchestration` / `react_ai.flows` | 多智能体编排器、Supervisor、意图路由、状态图工作流、BaseFlow 流程管道 |
 | [Guardrails](Guardrails.md) | `react_ai.guardrails` | Prompt 注入拦截、PII 脱敏、合规审核、护栏组合链 |
 | [Intent-Recognition](Intent-Recognition.md) | `examples/aftersales_langgraph.py` | 意图识别与槽位填充现状评估、企业级差距分析与改造路线（补充文档） |
